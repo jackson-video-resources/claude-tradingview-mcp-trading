@@ -72,7 +72,7 @@ Open the BitGet referral link in their default browser:
 "I've opened BitGet for you. Create your account if you haven't already, then
 come back and type 'done'."
 
-**[PAUSE]**
+**[PAUSE — wait for the user to type 'done' before continuing]**
 
 Now walk them through creating their API key on mobile:
 
