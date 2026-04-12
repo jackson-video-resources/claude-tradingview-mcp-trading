@@ -53,7 +53,7 @@ Type 'done' when you're ready."
 Run the following commands:
 
 ```bash
-git clone https://github.com/jackson-video-resources/claude-tradingview-mcp-trading
+git clone https://github.com/dbmartinb/claude-tradingview-mcp-trading
 cd claude-tradingview-mcp-trading
 ```
 
