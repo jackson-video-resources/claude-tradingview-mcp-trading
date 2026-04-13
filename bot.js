@@ -1,15 +1,26 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
- * Multi-strategy edition
+ * Multi-strategy, multi-asset edition
  *
- * Runs all 4 strategies on every tick and logs each decision to trades.csv.
+ * Runs all 14 strategies across all configured assets on every tick.
  * Set STRATEGY= in .env to choose which strategy executes orders.
+ * Set SYMBOLS= to a comma-separated list of assets to trade.
  *
  * Strategies:
- *   vwap_scalp  VWAP + RSI(3) + EMA(8)      — original scalping strategy
- *   ema_cross   EMA(9/21) crossover          — trend following
- *   bb_rsi      Bollinger Bands + RSI(14)    — mean reversion
- *   macd        MACD crossover (12/26/9)     — momentum
+ *   vwap_scalp         VWAP + RSI(3) + EMA(8)        — scalping
+ *   ema_cross          EMA(9/21) crossover            — trend following
+ *   bb_rsi             Bollinger Bands + RSI(14)      — mean reversion
+ *   macd               MACD crossover (12/26/9)       — momentum
+ *   stoch_rsi          Stochastic RSI                 — overbought/oversold
+ *   supertrend         Supertrend (ATR-based)         — trend direction
+ *   ichimoku           Ichimoku Cloud                 — multi-component trend
+ *   rsi_divergence     RSI Divergence                 — reversal signal
+ *   adx                ADX Trend Strength             — trend filter
+ *   ema_3              3-EMA System                   — triple alignment
+ *   heikin_ashi        Heikin Ashi Trend              — smoothed candles
+ *   orb                Opening Range Breakout         — session breakout
+ *   support_resistance Support / Resistance           — key level bounces
+ *   volume_profile     Volume Profile                 — high-volume price areas
  *
  * Local:  node bot.js
  * Cloud:  deploy to Railway, set env vars, Railway triggers on cron schedule
@@ -79,7 +90,8 @@ function checkOnboarding() {
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  symbol: process.env.SYMBOL || "BTCUSDT",
+  symbols: (process.env.SYMBOLS || process.env.SYMBOL || "BTCUSDT")
+    .split(",").map((s) => s.trim().toUpperCase()).filter(Boolean),
   timeframe: process.env.TIMEFRAME || "4H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
@@ -131,8 +143,12 @@ function validateConfig() {
   if (!validTimeframes.includes(CONFIG.timeframe))
     errors.push(`TIMEFRAME must be one of: ${validTimeframes.join(", ")}`);
 
-  if (!/^[A-Z]{2,20}$/.test(CONFIG.symbol))
-    errors.push("SYMBOL must be uppercase letters only (e.g. BTCUSDT)");
+  if (CONFIG.symbols.length === 0)
+    errors.push("SYMBOLS must contain at least one trading pair (e.g. BTCUSDT)");
+  for (const sym of CONFIG.symbols) {
+    if (!/^[A-Z0-9]{3,20}$/.test(sym))
+      errors.push(`Invalid symbol: ${sym} — must be uppercase alphanumeric (e.g. BTCUSDT)`);
+  }
 
   if (!["bitget","coinbase"].includes(CONFIG.exchange))
     errors.push("EXCHANGE must be 'bitget' or 'coinbase'");
@@ -159,13 +175,14 @@ function saveLog(log) {
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
 }
 
-function countTodaysTrades(log, strategyKey) {
+function countTodaysTrades(log, strategyKey, symbol) {
   const today = new Date().toISOString().slice(0, 10);
   return log.trades.filter(
     (t) =>
       t.timestamp.startsWith(today) &&
       t.orderPlaced &&
-      t.strategy === strategyKey,
+      t.strategy === strategyKey &&
+      t.symbol === symbol,
   ).length;
 }
 
@@ -291,6 +308,277 @@ function calcMACD(closes) {
     prevMACD: macdLine[macdLine.length - 2],
     prevSignal: signalSeries[signalSeries.length - 2],
   };
+}
+
+// RSI as a full series — needed for StochRSI and RSI Divergence
+function calcRSISeries(closes, period = 14) {
+  const series = [];
+  for (let i = period + 1; i <= closes.length; i++) {
+    series.push(calcRSI(closes.slice(0, i), period));
+  }
+  return series;
+}
+
+// Stochastic RSI — RSI normalised into a 0-100 oscillator
+// Returns %K (fast) and %D (3-period SMA of K)
+function calcStochRSI(closes, rsiPeriod = 14, stochPeriod = 14, kSmooth = 3) {
+  const rsiSeries = calcRSISeries(closes, rsiPeriod);
+  if (rsiSeries.length < stochPeriod + kSmooth + 1) return null;
+
+  const rawStoch = [];
+  for (let i = stochPeriod - 1; i < rsiSeries.length; i++) {
+    const window = rsiSeries.slice(i - stochPeriod + 1, i + 1);
+    const hi = Math.max(...window), lo = Math.min(...window);
+    rawStoch.push(hi === lo ? 50 : ((rsiSeries[i] - lo) / (hi - lo)) * 100);
+  }
+  if (rawStoch.length < kSmooth * 2) return null;
+
+  const sma = (arr, n) => arr.slice(-n).reduce((a, b) => a + b, 0) / n;
+  const k = sma(rawStoch, kSmooth);
+  const prevK = sma(rawStoch.slice(0, -kSmooth), kSmooth);
+  const d = (k + prevK) / 2;
+  return { k, d, prevK };
+}
+
+// ATR — Wilder's smoothed Average True Range
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    ));
+  }
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
+  return atr;
+}
+
+// Supertrend — ATR-based dynamic support/resistance
+// direction: 1 = price above line (bullish), -1 = price below line (bearish)
+function calcSupertrend(candles, period = 10, multiplier = 3.0) {
+  if (candles.length < period + 2) return null;
+
+  // Build ATR series using Wilder's smoothing
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    ));
+  }
+  const atrSeries = [null]; // index 0 has no ATR
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = 0; i < period - 1; i++) atrSeries.push(null);
+  atrSeries.push(atr);
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+    atrSeries.push(atr);
+  }
+
+  let prevUpper = null, prevLower = null, prevSuper = null, direction = 1;
+
+  for (let i = period; i < candles.length; i++) {
+    const c = candles[i], atrVal = atrSeries[i];
+    if (!atrVal) continue;
+    const hl2 = (c.high + c.low) / 2;
+
+    let upper = hl2 + multiplier * atrVal;
+    let lower = hl2 - multiplier * atrVal;
+
+    if (prevUpper !== null) upper = (upper < prevUpper || candles[i - 1].close > prevUpper) ? upper : prevUpper;
+    if (prevLower !== null) lower = (lower > prevLower || candles[i - 1].close < prevLower) ? lower : prevLower;
+
+    if (prevSuper === null) {
+      direction = c.close > hl2 ? 1 : -1;
+    } else if (direction === 1) {
+      direction = c.close < lower ? -1 : 1;
+    } else {
+      direction = c.close > upper ? 1 : -1;
+    }
+
+    prevUpper = upper; prevLower = lower;
+    prevSuper = direction === 1 ? lower : upper;
+  }
+
+  return { value: prevSuper, direction, upper: prevUpper, lower: prevLower };
+}
+
+// Ichimoku Cloud — five-component Japanese trend system
+function calcIchimoku(candles) {
+  if (candles.length < 78) return null; // need 52 + 26 for cloud projection
+
+  const hi = (arr, n) => Math.max(...arr.slice(-n).map((c) => c.high));
+  const lo = (arr, n) => Math.min(...arr.slice(-n).map((c) => c.low));
+
+  const tenkan  = (hi(candles, 9)  + lo(candles, 9))  / 2;
+  const kijun   = (hi(candles, 26) + lo(candles, 26)) / 2;
+  const senkouA = (tenkan + kijun) / 2;
+  const senkouB = (hi(candles, 52) + lo(candles, 52)) / 2;
+
+  // Current cloud is Senkou from 26 periods ago
+  const past = candles.slice(0, -26);
+  if (past.length < 52) return null;
+  const pastTenkan  = (hi(past, 9)  + lo(past, 9))  / 2;
+  const pastKijun   = (hi(past, 26) + lo(past, 26)) / 2;
+  const pastSpanA   = (pastTenkan + pastKijun) / 2;
+  const pastSpanB   = (hi(past, 52) + lo(past, 52)) / 2;
+  const cloudTop    = Math.max(pastSpanA, pastSpanB);
+  const cloudBottom = Math.min(pastSpanA, pastSpanB);
+
+  const chikou    = candles[candles.length - 1].close;
+  const priceAgo  = candles[candles.length - 27]?.close ?? null;
+
+  return { tenkan, kijun, senkouA, senkouB, cloudTop, cloudBottom, chikou, priceAgo };
+}
+
+// ADX — Average Directional Index with +DI / -DI
+// ADX > 25 = trending; +DI > -DI = up, +DI < -DI = down
+function calcADX(candles, period = 14) {
+  if (candles.length < period * 2 + 1) return null;
+
+  const plusDMs = [], minusDMs = [], trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const up   = candles[i].high - candles[i - 1].high;
+    const down = candles[i - 1].low - candles[i].low;
+    plusDMs.push(up > down && up > 0 ? up : 0);
+    minusDMs.push(down > up && down > 0 ? down : 0);
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low  - candles[i - 1].close),
+    ));
+  }
+
+  // Wilder's cumulative smoothing
+  const wilderSmooth = (arr) => {
+    let val = arr.slice(0, period).reduce((a, b) => a + b, 0);
+    const out = [val];
+    for (let i = period; i < arr.length; i++) { val = val - val / period + arr[i]; out.push(val); }
+    return out;
+  };
+
+  const sTR = wilderSmooth(trs);
+  const sPDM = wilderSmooth(plusDMs);
+  const sMDM = wilderSmooth(minusDMs);
+
+  const plusDI  = (sPDM[sPDM.length - 1] / sTR[sTR.length - 1]) * 100;
+  const minusDI = (sMDM[sMDM.length - 1] / sTR[sTR.length - 1]) * 100;
+
+  const dxSeries = sPDM.map((_, i) => {
+    const pdi = (sPDM[i] / sTR[i]) * 100;
+    const mdi = (sMDM[i] / sTR[i]) * 100;
+    const sum = pdi + mdi;
+    return sum === 0 ? 0 : (Math.abs(pdi - mdi) / sum) * 100;
+  });
+
+  let adx = dxSeries.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxSeries.length; i++) adx = (adx * (period - 1) + dxSeries[i]) / period;
+
+  return { adx, plusDI, minusDI };
+}
+
+// Heikin Ashi — smoothed candles that filter out noise
+function calcHeikinAshi(candles) {
+  const ha = [];
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const haClose = (c.open + c.high + c.low + c.close) / 4;
+    const haOpen  = i === 0 ? (c.open + c.close) / 2 : (ha[i - 1].open + ha[i - 1].close) / 2;
+    ha.push({
+      open:  haOpen,
+      high:  Math.max(c.high, haOpen, haClose),
+      low:   Math.min(c.low,  haOpen, haClose),
+      close: haClose,
+      time:  c.time,
+    });
+  }
+  return ha;
+}
+
+// Opening Range — first candle of the UTC trading day
+function calcOpeningRange(candles) {
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayMs = todayStart.getTime();
+  const todayCandles = candles.filter((c) => c.time >= todayMs);
+  if (todayCandles.length < 2) return null; // need at least 2 candles — can't trade the ORB candle itself
+  return { high: todayCandles[0].high, low: todayCandles[0].low, open: todayCandles[0].open };
+}
+
+// Support & Resistance — swing highs/lows over the last `lookback` candles
+function calcSupportResistance(candles, lookback = 40) {
+  if (candles.length < lookback + 4) return null;
+  const price   = candles[candles.length - 1].close;
+  const slice   = candles.slice(-lookback);
+  const swingHi = [], swingLo = [];
+
+  for (let i = 2; i < slice.length - 2; i++) {
+    const h = slice[i].high;
+    if (h > slice[i-1].high && h > slice[i-2].high && h > slice[i+1].high && h > slice[i+2].high) swingHi.push(h);
+    const l = slice[i].low;
+    if (l < slice[i-1].low  && l < slice[i-2].low  && l < slice[i+1].low  && l < slice[i+2].low)  swingLo.push(l);
+  }
+
+  const resistance = swingHi.filter((h) => h > price).sort((a, b) => a - b)[0] ?? null;
+  const support    = swingLo.filter((l) => l < price).sort((a, b) => b - a)[0] ?? null;
+  return { support, resistance };
+}
+
+// Volume Profile — Point of Control and Value Area over last `lookback` candles
+function calcVolumeProfile(candles, lookback = 50) {
+  const slice    = candles.slice(-lookback);
+  const prices   = slice.map((c) => c.close);
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+  const BUCKETS  = 20;
+  const bucketSz = (maxPrice - minPrice) / BUCKETS;
+  if (bucketSz === 0) return null;
+
+  const profile = new Array(BUCKETS).fill(0);
+  for (const c of slice) {
+    const b = Math.min(Math.floor((c.close - minPrice) / bucketSz), BUCKETS - 1);
+    profile[b] += c.volume;
+  }
+
+  const maxVol  = Math.max(...profile);
+  const pocIdx  = profile.indexOf(maxVol);
+  const poc     = minPrice + (pocIdx + 0.5) * bucketSz;
+
+  // Value Area — expand from POC until 70% of volume is covered
+  const totalVol = profile.reduce((a, b) => a + b, 0);
+  let accVol = profile[pocIdx], lo = pocIdx, hi = pocIdx;
+  while (accVol < totalVol * 0.7 && (lo > 0 || hi < BUCKETS - 1)) {
+    const addLo = lo > 0           ? profile[lo - 1] : 0;
+    const addHi = hi < BUCKETS - 1 ? profile[hi + 1] : 0;
+    if (addLo >= addHi && lo > 0)      { accVol += addLo; lo--; }
+    else if (hi < BUCKETS - 1)         { accVol += addHi; hi++; }
+    else break;
+  }
+
+  return {
+    poc,
+    valueAreaHigh: minPrice + (hi + 1) * bucketSz,
+    valueAreaLow:  minPrice + lo * bucketSz,
+  };
+}
+
+// RSI Divergence — compares recent price swings vs RSI swings
+// Bullish: price makes lower low but RSI makes higher low (hidden strength)
+// Bearish: price makes higher high but RSI makes lower high (hidden weakness)
+function calcRSIDivergence(closes, rsiSeries, lookback = 14) {
+  if (closes.length < lookback * 2 || rsiSeries.length < lookback * 2) return null;
+
+  const recentP = closes.slice(-lookback),    prevP = closes.slice(-lookback * 2, -lookback);
+  const recentR = rsiSeries.slice(-lookback), prevR = rsiSeries.slice(-lookback * 2, -lookback);
+
+  const bullish = Math.min(...recentP) < Math.min(...prevP) && Math.min(...recentR) > Math.min(...prevR);
+  const bearish = Math.max(...recentP) > Math.max(...prevP) && Math.max(...recentR) < Math.max(...prevR);
+
+  return { bullish, bearish };
 }
 
 // ─── Strategy Evaluators ─────────────────────────────────────────────────────
@@ -430,11 +718,310 @@ function evalMACD(macdData) {
   return { key: "macd", name: "MACD Crossover (12/26/9)", signal, conditions, allPass: conditions.every((c) => c.pass) };
 }
 
+// ── Strategy 5: Stochastic RSI ───────────────────────────────────────────────
+// K < 20 crossing above D = oversold recovery (long). K > 80 crossing below D = overbought reversal (short).
+function evalStochRSI(stochRSI) {
+  const conditions = [];
+  let signal = "none";
+  const { k, d, prevK } = stochRSI;
+
+  console.log("\n── Strategy 5: Stochastic RSI ───────────────────────────\n");
+
+  if (k < 50) {
+    console.log(`  Bias: BULLISH SETUP (K=${k.toFixed(2)} below midline)\n`);
+    signal = "long";
+    conditions.push(condition("StochRSI K oversold (below 20)", "< 20", k.toFixed(2), k < 20));
+    conditions.push(condition("K crossing above D (momentum turning up)", `D=${d.toFixed(2)}`, `K=${k.toFixed(2)}`, k > d && prevK <= d));
+    conditions.push(condition("K below 50 (not already extended)", "< 50", k.toFixed(2), k < 50));
+  } else {
+    console.log(`  Bias: BEARISH SETUP (K=${k.toFixed(2)} above midline)\n`);
+    signal = "short";
+    conditions.push(condition("StochRSI K overbought (above 80)", "> 80", k.toFixed(2), k > 80));
+    conditions.push(condition("K crossing below D (momentum turning down)", `D=${d.toFixed(2)}`, `K=${k.toFixed(2)}`, k < d && prevK >= d));
+    conditions.push(condition("K above 50 (not already extended)", "> 50", k.toFixed(2), k > 50));
+  }
+
+  return { key: "stoch_rsi", name: "Stochastic RSI", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 6: Supertrend ────────────────────────────────────────────────────
+// Price above Supertrend line = bullish. Price below = bearish. Direction change = entry.
+function evalSupertrend(price, supertrend) {
+  const conditions = [];
+  const { value, direction } = supertrend;
+  let signal = "none";
+
+  console.log("\n── Strategy 6: Supertrend (ATR 10, mult 3.0) ────────────\n");
+
+  if (direction === 1) {
+    console.log(`  Bias: BULLISH (price above Supertrend)\n`);
+    signal = "long";
+    conditions.push(condition("Price above Supertrend line (uptrend)", `> ${value.toFixed(2)}`, price.toFixed(2), price > value));
+    conditions.push(condition("Supertrend direction is bullish", "= 1", String(direction), direction === 1));
+    const dist = ((price - value) / price) * 100;
+    conditions.push(condition("Price within 3% of Supertrend (fresh signal)", "< 3%", `${dist.toFixed(2)}%`, dist < 3));
+  } else {
+    console.log(`  Bias: BEARISH (price below Supertrend)\n`);
+    signal = "short";
+    conditions.push(condition("Price below Supertrend line (downtrend)", `< ${value.toFixed(2)}`, price.toFixed(2), price < value));
+    conditions.push(condition("Supertrend direction is bearish", "= -1", String(direction), direction === -1));
+    const dist = ((value - price) / price) * 100;
+    conditions.push(condition("Price within 3% of Supertrend (fresh signal)", "< 3%", `${dist.toFixed(2)}%`, dist < 3));
+  }
+
+  return { key: "supertrend", name: "Supertrend", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 7: Ichimoku Cloud ────────────────────────────────────────────────
+// Strong signal: price above/below cloud, Tenkan/Kijun aligned, Chikou confirms.
+function evalIchimoku(price, ichimoku) {
+  const { tenkan, kijun, cloudTop, cloudBottom, chikou, priceAgo } = ichimoku;
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 7: Ichimoku Cloud ───────────────────────────\n");
+
+  const aboveCloud = price > cloudTop;
+  const belowCloud = price < cloudBottom;
+
+  if (aboveCloud) {
+    console.log(`  Bias: BULLISH (price above cloud)\n`);
+    signal = "long";
+    conditions.push(condition("Price above cloud top", `> ${cloudTop.toFixed(2)}`, price.toFixed(2), aboveCloud));
+    conditions.push(condition("Tenkan above Kijun (bullish cross)", `> ${kijun.toFixed(2)}`, tenkan.toFixed(2), tenkan > kijun));
+    conditions.push(condition("Chikou above price from 26 periods ago", `> ${priceAgo?.toFixed(2) ?? "N/A"}`, chikou.toFixed(2), priceAgo !== null && chikou > priceAgo));
+  } else if (belowCloud) {
+    console.log(`  Bias: BEARISH (price below cloud)\n`);
+    signal = "short";
+    conditions.push(condition("Price below cloud bottom", `< ${cloudBottom.toFixed(2)}`, price.toFixed(2), belowCloud));
+    conditions.push(condition("Tenkan below Kijun (bearish cross)", `< ${kijun.toFixed(2)}`, tenkan.toFixed(2), tenkan < kijun));
+    conditions.push(condition("Chikou below price from 26 periods ago", `< ${priceAgo?.toFixed(2) ?? "N/A"}`, chikou.toFixed(2), priceAgo !== null && chikou < priceAgo));
+  } else {
+    console.log("  Bias: NEUTRAL — price inside cloud.\n");
+    conditions.push({ label: "Price outside cloud", required: "Above or below cloud", actual: "Inside cloud", pass: false });
+  }
+
+  return { key: "ichimoku", name: "Ichimoku Cloud", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 8: RSI Divergence ────────────────────────────────────────────────
+// Price and RSI moving in opposite directions — signals upcoming reversal.
+function evalRSIDivergence(divergence, rsi14) {
+  const { bullish, bearish } = divergence;
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 8: RSI Divergence ───────────────────────────\n");
+
+  if (bearish) {
+    console.log("  Bias: BEARISH DIVERGENCE (price higher high, RSI lower high)\n");
+    signal = "short";
+    conditions.push(condition("Bearish divergence detected", "price HH + RSI LH", "YES", bearish));
+    conditions.push(condition("RSI not deeply oversold (valid bearish)", "> 40", rsi14.toFixed(2), rsi14 > 40));
+  } else if (bullish) {
+    console.log("  Bias: BULLISH DIVERGENCE (price lower low, RSI higher low)\n");
+    signal = "long";
+    conditions.push(condition("Bullish divergence detected", "price LL + RSI HL", "YES", bullish));
+    conditions.push(condition("RSI not deeply overbought (valid bullish)", "< 60", rsi14.toFixed(2), rsi14 < 60));
+  } else {
+    console.log("  Bias: NEUTRAL — no divergence detected.\n");
+    conditions.push({ label: "Divergence detected", required: "Bullish or bearish divergence", actual: "None", pass: false });
+  }
+
+  return { key: "rsi_divergence", name: "RSI Divergence", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 9: ADX Trend Strength ───────────────────────────────────────────
+// Only trades when ADX > 25 (strong trend). Direction from +DI vs -DI.
+function evalADX(adxData) {
+  const { adx, plusDI, minusDI } = adxData;
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 9: ADX Trend Strength ──────────────────────\n");
+
+  if (plusDI > minusDI) {
+    console.log(`  Bias: BULLISH (+DI ${plusDI.toFixed(2)} > -DI ${minusDI.toFixed(2)})\n`);
+    signal = "long";
+    conditions.push(condition("ADX shows strong trend (> 25)", "> 25", adx.toFixed(2), adx > 25));
+    conditions.push(condition("+DI above -DI (bullish pressure)", `> ${minusDI.toFixed(2)}`, plusDI.toFixed(2), plusDI > minusDI));
+    conditions.push(condition("+DI clearly dominant (> 5 spread)", "> 5 spread", (plusDI - minusDI).toFixed(2), plusDI - minusDI > 5));
+  } else {
+    console.log(`  Bias: BEARISH (-DI ${minusDI.toFixed(2)} > +DI ${plusDI.toFixed(2)})\n`);
+    signal = "short";
+    conditions.push(condition("ADX shows strong trend (> 25)", "> 25", adx.toFixed(2), adx > 25));
+    conditions.push(condition("-DI above +DI (bearish pressure)", `> ${plusDI.toFixed(2)}`, minusDI.toFixed(2), minusDI > plusDI));
+    conditions.push(condition("-DI clearly dominant (> 5 spread)", "> 5 spread", (minusDI - plusDI).toFixed(2), minusDI - plusDI > 5));
+  }
+
+  return { key: "adx", name: "ADX Trend Strength", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 10: 3-EMA System ─────────────────────────────────────────────────
+// All three EMAs stacked in order = clean trend. Entry on pullback to middle EMA.
+function evalThreeEMA(price, ema8, ema21, ema50) {
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 10: 3-EMA System (8/21/50) ─────────────────\n");
+
+  const bullStack = ema8 > ema21 && ema21 > ema50;
+  const bearStack = ema8 < ema21 && ema21 < ema50;
+
+  if (bullStack) {
+    console.log(`  Bias: BULLISH (EMA8 > EMA21 > EMA50)\n`);
+    signal = "long";
+    conditions.push(condition("EMA(8) > EMA(21) > EMA(50) stacked bullish", `${ema21.toFixed(2)} < ${ema8.toFixed(2)}`, `EMA50=${ema50.toFixed(2)}`, bullStack));
+    const distToEma21 = ((price - ema21) / price) * 100;
+    conditions.push(condition("Price near EMA(21) — pullback entry", "within 1%", `${distToEma21.toFixed(2)}%`, Math.abs(distToEma21) < 1));
+    conditions.push(condition("Price above EMA(50) — in uptrend zone", `> ${ema50.toFixed(2)}`, price.toFixed(2), price > ema50));
+  } else if (bearStack) {
+    console.log(`  Bias: BEARISH (EMA8 < EMA21 < EMA50)\n`);
+    signal = "short";
+    conditions.push(condition("EMA(8) < EMA(21) < EMA(50) stacked bearish", `${ema21.toFixed(2)} > ${ema8.toFixed(2)}`, `EMA50=${ema50.toFixed(2)}`, bearStack));
+    const distToEma21 = ((ema21 - price) / price) * 100;
+    conditions.push(condition("Price near EMA(21) — pullback entry", "within 1%", `${distToEma21.toFixed(2)}%`, Math.abs(distToEma21) < 1));
+    conditions.push(condition("Price below EMA(50) — in downtrend zone", `< ${ema50.toFixed(2)}`, price.toFixed(2), price < ema50));
+  } else {
+    console.log("  Bias: NEUTRAL — EMAs not stacked in order.\n");
+    conditions.push({ label: "EMA stack aligned", required: "8 > 21 > 50 or 8 < 21 < 50", actual: "Mixed", pass: false });
+  }
+
+  return { key: "ema_3", name: "3-EMA System (8/21/50)", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 11: Heikin Ashi Trend ────────────────────────────────────────────
+// 3 consecutive bullish/bearish HA candles with no opposing wicks = strong trend.
+function evalHeikinAshi(haCandles) {
+  const conditions = [];
+  let signal = "none";
+  const last3 = haCandles.slice(-3);
+
+  console.log("\n── Strategy 11: Heikin Ashi Trend ──────────────────────\n");
+
+  const allBullish = last3.every((c) => c.close > c.open);
+  const allBearish = last3.every((c) => c.close < c.open);
+  const noLowerWick = last3.every((c) => c.low === Math.min(c.open, c.close));   // bullish: no lower wick
+  const noUpperWick = last3.every((c) => c.high === Math.max(c.open, c.close));  // bearish: no upper wick
+
+  if (allBullish) {
+    console.log("  Bias: BULLISH (3 consecutive green HA candles)\n");
+    signal = "long";
+    conditions.push(condition("Last 3 HA candles are bullish (green)", "close > open × 3", "YES", allBullish));
+    conditions.push(condition("No lower wicks (strong buyers, no pullback)", "no lower wick × 3", noLowerWick ? "YES" : "HAS WICKS", noLowerWick));
+  } else if (allBearish) {
+    console.log("  Bias: BEARISH (3 consecutive red HA candles)\n");
+    signal = "short";
+    conditions.push(condition("Last 3 HA candles are bearish (red)", "close < open × 3", "YES", allBearish));
+    conditions.push(condition("No upper wicks (strong sellers, no pullback)", "no upper wick × 3", noUpperWick ? "YES" : "HAS WICKS", noUpperWick));
+  } else {
+    console.log("  Bias: NEUTRAL — no consistent HA trend.\n");
+    conditions.push({ label: "3 consecutive HA candles", required: "All bullish or all bearish", actual: "Mixed", pass: false });
+  }
+
+  return { key: "heikin_ashi", name: "Heikin Ashi Trend", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 12: Opening Range Breakout ───────────────────────────────────────
+// Break above/below the first candle of the UTC session = directional signal.
+function evalORB(price, orb) {
+  const { high: orbHigh, low: orbLow } = orb;
+  const conditions = [];
+  let signal = "none";
+  const orbRange = orbHigh - orbLow;
+
+  console.log("\n── Strategy 12: Opening Range Breakout ──────────────────\n");
+  console.log(`  ORB High: $${orbHigh.toFixed(2)} | ORB Low: $${orbLow.toFixed(2)}\n`);
+
+  if (price > orbHigh) {
+    signal = "long";
+    const breakout = ((price - orbHigh) / orbHigh) * 100;
+    conditions.push(condition("Price broke above ORB high", `> ${orbHigh.toFixed(2)}`, price.toFixed(2), price > orbHigh));
+    conditions.push(condition("Breakout within 2% (not too extended)", "< 2%", `${breakout.toFixed(2)}%`, breakout < 2));
+    conditions.push(condition("ORB range meaningful (> 0.3%)", "> 0.3%", `${((orbRange / orbLow) * 100).toFixed(2)}%`, orbRange / orbLow > 0.003));
+  } else if (price < orbLow) {
+    signal = "short";
+    const breakout = ((orbLow - price) / orbLow) * 100;
+    conditions.push(condition("Price broke below ORB low", `< ${orbLow.toFixed(2)}`, price.toFixed(2), price < orbLow));
+    conditions.push(condition("Breakout within 2% (not too extended)", "< 2%", `${breakout.toFixed(2)}%`, breakout < 2));
+    conditions.push(condition("ORB range meaningful (> 0.3%)", "> 0.3%", `${((orbRange / orbLow) * 100).toFixed(2)}%`, orbRange / orbLow > 0.003));
+  } else {
+    console.log("  Bias: NEUTRAL — price inside opening range.\n");
+    conditions.push({ label: "ORB breakout", required: "Price above ORB high or below ORB low", actual: "Inside range", pass: false });
+  }
+
+  return { key: "orb", name: "Opening Range Breakout", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 13: Support / Resistance ────────────────────────────────────────
+// Price bouncing off a key level — confirmed by RSI not being at an extreme.
+function evalSupportResistance(price, sr, rsi14) {
+  const { support, resistance } = sr;
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 13: Support / Resistance ───────────────────\n");
+  if (support)    console.log(`  Nearest support:    $${support.toFixed(2)}`);
+  if (resistance) console.log(`  Nearest resistance: $${resistance.toFixed(2)}\n`);
+
+  const nearSupport    = support    && Math.abs((price - support)    / price) < 0.005;
+  const nearResistance = resistance && Math.abs((price - resistance) / price) < 0.005;
+
+  if (nearSupport) {
+    signal = "long";
+    conditions.push(condition("Price at support level (within 0.5%)", `~${support.toFixed(2)}`, price.toFixed(2), nearSupport));
+    conditions.push(condition("RSI not overbought (room to bounce)", "< 60", rsi14.toFixed(2), rsi14 < 60));
+    conditions.push(condition("Support level exists", "swing low found", support ? "YES" : "NO", !!support));
+  } else if (nearResistance) {
+    signal = "short";
+    conditions.push(condition("Price at resistance level (within 0.5%)", `~${resistance.toFixed(2)}`, price.toFixed(2), nearResistance));
+    conditions.push(condition("RSI not oversold (room to reject)", "> 40", rsi14.toFixed(2), rsi14 > 40));
+    conditions.push(condition("Resistance level exists", "swing high found", resistance ? "YES" : "NO", !!resistance));
+  } else {
+    console.log("  Bias: NEUTRAL — price not at a key level.\n");
+    conditions.push({ label: "Price at key level", required: "Within 0.5% of support or resistance", actual: "Mid-range", pass: false });
+  }
+
+  return { key: "support_resistance", name: "Support / Resistance", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
+// ── Strategy 14: Volume Profile ───────────────────────────────────────────────
+// Trades toward the Point of Control (POC) from the Value Area edges.
+function evalVolumeProfile(price, vp, rsi14) {
+  const { poc, valueAreaHigh, valueAreaLow } = vp;
+  const conditions = [];
+  let signal = "none";
+
+  console.log("\n── Strategy 14: Volume Profile ──────────────────────────\n");
+  console.log(`  POC: $${poc.toFixed(2)} | VAH: $${valueAreaHigh.toFixed(2)} | VAL: $${valueAreaLow.toFixed(2)}\n`);
+
+  const atVAL = price <= valueAreaLow  * 1.003;
+  const atVAH = price >= valueAreaHigh * 0.997;
+  const abovePOC = price > poc;
+
+  if (atVAL && !abovePOC) {
+    signal = "long";
+    conditions.push(condition("Price at Value Area Low (buyers expected)", `≤ ${valueAreaLow.toFixed(2)}`, price.toFixed(2), atVAL));
+    conditions.push(condition("RSI oversold (< 40) — confirms weakness exhausted", "< 40", rsi14.toFixed(2), rsi14 < 40));
+    conditions.push(condition("POC above price — magnetic target", `> ${price.toFixed(2)}`, poc.toFixed(2), poc > price));
+  } else if (atVAH && abovePOC) {
+    signal = "short";
+    conditions.push(condition("Price at Value Area High (sellers expected)", `≥ ${valueAreaHigh.toFixed(2)}`, price.toFixed(2), atVAH));
+    conditions.push(condition("RSI overbought (> 60) — confirms strength exhausted", "> 60", rsi14.toFixed(2), rsi14 > 60));
+    conditions.push(condition("POC below price — magnetic target", `< ${price.toFixed(2)}`, poc.toFixed(2), poc < price));
+  } else {
+    console.log("  Bias: NEUTRAL — price not at Value Area edge.\n");
+    conditions.push({ label: "Price at Value Area edge", required: "At VAH or VAL", actual: "Mid-range", pass: false });
+  }
+
+  return { key: "volume_profile", name: "Volume Profile", signal, conditions, allPass: conditions.every((c) => c.pass) };
+}
+
 // ─── Trade Limits ────────────────────────────────────────────────────────────
 
-function checkTradeLimits(log, strategyKey) {
-  const todayCount = countTodaysTrades(log, strategyKey);
-  console.log(`\n── Trade Limits [${strategyKey}] ─────────────────────────────────\n`);
+function checkTradeLimits(log, strategyKey, symbol) {
+  const todayCount = countTodaysTrades(log, strategyKey, symbol);
+  console.log(`\n── Trade Limits [${strategyKey} / ${symbol}] ──────────────────────\n`);
 
   if (todayCount >= CONFIG.maxTradesPerDay) {
     console.log(`🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`);
@@ -537,6 +1124,7 @@ function toCoinbaseSymbol(symbol) {
     BNBUSDT: "BNB-USD", XRPUSDT: "XRP-USD", ADAUSDT: "ADA-USD",
     DOGEUSDT: "DOGE-USD", AVAXUSDT: "AVAX-USD", MATICUSDT: "MATIC-USD",
     LINKUSDT: "LINK-USD", DOTUSDT: "DOT-USD", LTCUSDT: "LTC-USD",
+    TAOUSDT: "TAO-USD",
   };
   return map[symbol] || symbol.replace("USDT", "-USD");
 }
@@ -822,131 +1410,135 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Per-Symbol Processing ───────────────────────────────────────────────────
 
-async function run() {
-  checkOnboarding();
-  validateConfig();
-  initCsv();
+async function processSymbol(symbol, log) {
+  console.log(`\n${"─".repeat(59)}`);
+  console.log(`  ▶ ${symbol}`);
+  console.log("─".repeat(59));
 
-  console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Claude Trading Bot — Multi-Strategy Edition");
-  console.log(`  ${new Date().toISOString()}`);
-  console.log(`  Mode:     ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
-  console.log(`  Symbol:   ${CONFIG.symbol} (${CONFIG.timeframe})`);
-  console.log(`  Active:   ${CONFIG.strategy} (executes orders)`);
-  console.log(`  Logging:  all 4 strategies → trades.csv`);
-  console.log("═══════════════════════════════════════════════════════════");
+  // Fetch candles — 200 gives enough history for all indicators
+  const candles = await fetchCandles(symbol, CONFIG.timeframe, 200);
+  const closes     = candles.map((c) => c.close);
+  const prevCloses = closes.slice(0, -1);
+  const price      = closes[closes.length - 1];
+  console.log(`\n  Current price: $${price.toFixed(2)}`);
 
-  if (CONFIG.azureSQL.enabled) {
-    console.log(`\n── Azure SQL ─────────────────────────────────────────────\n`);
-    console.log(`  Server: ${CONFIG.azureSQL.server}`);
-    await initAzureSQL();
-  }
-
-  const log = loadLog();
-
-  // Fetch candles — 200 candles gives enough history for MACD signal line
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 200);
-  const closes = candles.map((c) => c.close);
-  const prevCloses = closes.slice(0, -1); // one candle back — for crossover detection
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
-
-  // Calculate all indicators upfront
-  const ema8     = calcEMA(closes, 8);
-  const ema9     = calcEMA(closes, 9);
-  const ema21    = calcEMA(closes, 21);
+  // ── Indicators ────────────────────────────────────────────────────────────
+  const ema8      = calcEMA(closes, 8);
+  const ema9      = calcEMA(closes, 9);
+  const ema21     = calcEMA(closes, 21);
+  const ema50     = calcEMA(closes, 50);
   const prevEma9  = calcEMA(prevCloses, 9);
   const prevEma21 = calcEMA(prevCloses, 21);
-  const rsi3     = calcRSI(closes, 3);
-  const rsi14    = calcRSI(closes, 14);
-  const vwap     = calcVWAP(candles);
-  const bb       = calcBollingerBands(closes);
-  const macdData = calcMACD(closes);
+  const rsi3      = calcRSI(closes, 3);
+  const rsi14     = calcRSI(closes, 14);
+  const vwap      = calcVWAP(candles);
+  const bb        = calcBollingerBands(closes);
+  const macdData  = calcMACD(closes);
+  const stochRSI  = calcStochRSI(closes);
+  const supertrnd = calcSupertrend(candles);
+  const ichimoku  = calcIchimoku(candles);
+  const adxData   = calcADX(candles);
+  const haCandles = calcHeikinAshi(candles);
+  const orb       = calcOpeningRange(candles);
+  const sr        = calcSupportResistance(candles);
+  const vp        = calcVolumeProfile(candles);
+  const rsiSeries = calcRSISeries(closes, 14);
+  const divergence = calcRSIDivergence(closes, rsiSeries);
 
   console.log(`\n  EMA(8):   $${ema8?.toFixed(2)    ?? "N/A"}`);
-  console.log(`  EMA(9):   $${ema9?.toFixed(2)    ?? "N/A"}`);
   console.log(`  EMA(21):  $${ema21?.toFixed(2)   ?? "N/A"}`);
+  console.log(`  EMA(50):  $${ema50?.toFixed(2)   ?? "N/A"}`);
   console.log(`  RSI(3):    ${rsi3?.toFixed(2)    ?? "N/A"}`);
   console.log(`  RSI(14):   ${rsi14?.toFixed(2)   ?? "N/A"}`);
   console.log(`  VWAP:     $${vwap?.toFixed(2)    ?? "N/A"}`);
   console.log(`  BB Lower: $${bb?.lower.toFixed(2) ?? "N/A"}`);
   console.log(`  BB Upper: $${bb?.upper.toFixed(2) ?? "N/A"}`);
   console.log(`  MACD:      ${macdData?.macd.toFixed(4)   ?? "N/A"}`);
-  console.log(`  Signal:    ${macdData?.signal.toFixed(4) ?? "N/A"}`);
+  console.log(`  StochRSI K: ${stochRSI?.k.toFixed(2)    ?? "N/A"}`);
+  console.log(`  Supertrend: $${supertrnd?.value.toFixed(2) ?? "N/A"} (${supertrnd?.direction === 1 ? "▲ bull" : "▼ bear"})`);
+  console.log(`  ADX:       ${adxData?.adx.toFixed(2) ?? "N/A"} (+DI ${adxData?.plusDI.toFixed(2) ?? "N/A"} / -DI ${adxData?.minusDI.toFixed(2) ?? "N/A"})`);
+  if (vp) console.log(`  POC:      $${vp.poc.toFixed(2)} | VAH $${vp.valueAreaHigh.toFixed(2)} | VAL $${vp.valueAreaLow.toFixed(2)}`);
 
-  // Evaluate all strategies
+  // ── Strategy Evaluation ───────────────────────────────────────────────────
   const strategies = [];
-  if (vwap && rsi3 !== null && ema8)                                          strategies.push(evalVWAPScalp(price, ema8, vwap, rsi3));
-  if (ema9 && ema21 && prevEma9 && prevEma21 && rsi14 !== null)               strategies.push(evalEMACross(price, ema9, ema21, prevEma9, prevEma21, rsi14));
-  if (bb && rsi14 !== null)                                                   strategies.push(evalBBRSI(price, bb, rsi14));
-  if (macdData)                                                               strategies.push(evalMACD(macdData));
+  if (vwap && rsi3 !== null && ema8)                                              strategies.push(evalVWAPScalp(price, ema8, vwap, rsi3));
+  if (ema9 && ema21 && prevEma9 && prevEma21 && rsi14 !== null)                   strategies.push(evalEMACross(price, ema9, ema21, prevEma9, prevEma21, rsi14));
+  if (bb && rsi14 !== null)                                                       strategies.push(evalBBRSI(price, bb, rsi14));
+  if (macdData)                                                                   strategies.push(evalMACD(macdData));
+  if (stochRSI)                                                                   strategies.push(evalStochRSI(stochRSI));
+  if (supertrnd)                                                                  strategies.push(evalSupertrend(price, supertrnd));
+  if (ichimoku)                                                                   strategies.push(evalIchimoku(price, ichimoku));
+  if (divergence && rsi14 !== null)                                               strategies.push(evalRSIDivergence(divergence, rsi14));
+  if (adxData)                                                                    strategies.push(evalADX(adxData));
+  if (ema8 && ema21 && ema50)                                                     strategies.push(evalThreeEMA(price, ema8, ema21, ema50));
+  if (haCandles.length >= 3)                                                      strategies.push(evalHeikinAshi(haCandles));
+  if (orb)                                                                        strategies.push(evalORB(price, orb));
+  if (sr && rsi14 !== null)                                                       strategies.push(evalSupportResistance(price, sr, rsi14));
+  if (vp && rsi14 !== null)                                                       strategies.push(evalVolumeProfile(price, vp, rsi14));
 
-  // Summary table
+  // ── Summary ───────────────────────────────────────────────────────────────
   console.log("\n── Strategy Summary ─────────────────────────────────────\n");
   for (const s of strategies) {
     const icon = s.allPass ? "✅" : "🚫";
     const exec = s.key === CONFIG.strategy ? " ← active" : "";
-    console.log(`  ${icon} ${s.name.padEnd(30)} signal=${s.signal.padEnd(5)} ${s.allPass ? "FIRES" : "blocked"}${exec}`);
+    console.log(`  ${icon} ${s.name.padEnd(32)} signal=${s.signal.padEnd(5)} ${s.allPass ? "FIRES" : "blocked"}${exec}`);
   }
 
-  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
-  const withinLimits = checkTradeLimits(log, CONFIG.strategy);
+  const tradeSize    = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+  const withinLimits = checkTradeLimits(log, CONFIG.strategy, symbol);
 
-  // Process each strategy — log all, execute only the active one
+  // ── Decisions ─────────────────────────────────────────────────────────────
   console.log("\n── Decisions ────────────────────────────────────────────\n");
 
   for (const s of strategies) {
-    const isActive = s.key === CONFIG.strategy;
-    const shouldExecute = isActive && s.allPass && withinLimits;
+    const isActive     = s.key === CONFIG.strategy;
 
     const logEntry = {
-      timestamp: new Date().toISOString(),
-      symbol: CONFIG.symbol,
-      timeframe: CONFIG.timeframe,
-      strategy: s.key,
+      timestamp:    new Date().toISOString(),
+      symbol,
+      timeframe:    CONFIG.timeframe,
+      strategy:     s.key,
       strategyName: s.name,
-      signal: s.signal,
+      signal:       s.signal,
       price,
-      conditions: s.conditions,
-      allPass: s.allPass,
+      conditions:   s.conditions,
+      allPass:      s.allPass,
       tradeSize,
-      orderPlaced: false,
-      orderId: null,
+      orderPlaced:  false,
+      orderId:      null,
       paperTrading: CONFIG.paperTrading,
       limits: {
-        maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-        maxTradesPerDay: CONFIG.maxTradesPerDay,
-        tradesToday: countTodaysTrades(log, s.key),
+        maxTradeSizeUSD:  CONFIG.maxTradeSizeUSD,
+        maxTradesPerDay:  CONFIG.maxTradesPerDay,
+        tradesToday:      countTodaysTrades(log, s.key, symbol),
       },
     };
 
     if (!s.allPass) {
       const failed = s.conditions.filter((c) => !c.pass).map((c) => c.label);
-      const tag = isActive ? "(active — blocked)" : "(monitoring)";
-      console.log(`🚫 [${s.name}] ${tag}`);
+      console.log(`🚫 [${s.name}] ${isActive ? "(active — blocked)" : "(monitoring)"}`);
       failed.forEach((f) => console.log(`   - ${f}`));
     } else if (!isActive) {
-      console.log(`📊 [${s.name}] SIGNAL fired — logged for comparison (not active strategy)`);
+      console.log(`📊 [${s.name}] SIGNAL fired — logged for comparison`);
     } else if (!withinLimits) {
-      console.log(`🚫 [${s.name}] SIGNAL fired but daily trade limit reached`);
+      console.log(`🚫 [${s.name}] SIGNAL fired but daily limit reached for ${symbol}`);
     } else {
       console.log(`✅ [${s.name}] ALL CONDITIONS MET`);
       if (CONFIG.paperTrading) {
         const dir = s.signal === "long" ? "BUY" : "SELL";
-        console.log(`\n📋 PAPER TRADE — ${dir} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`);
+        console.log(`\n📋 PAPER TRADE — ${dir} ${symbol} ~$${tradeSize.toFixed(2)} at market`);
         console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
         logEntry.orderPlaced = true;
-        logEntry.orderId = `PAPER-${Date.now()}`;
+        logEntry.orderId     = `PAPER-${Date.now()}`;
       } else {
         const side = s.signal === "long" ? "buy" : "sell";
-        console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${CONFIG.symbol}`);
+        console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${symbol}`);
         try {
-          const order = await placeOrder(CONFIG.symbol, side, tradeSize, price);
+          const order = await placeOrder(symbol, side, tradeSize, price);
           logEntry.orderPlaced = true;
-          logEntry.orderId = order.orderId;
+          logEntry.orderId     = order.orderId;
           console.log(`✅ ORDER PLACED — ${order.orderId}`);
         } catch (err) {
           console.log(`❌ ORDER FAILED — ${err.message}`);
@@ -958,6 +1550,39 @@ async function run() {
     log.trades.push(logEntry);
     writeTradeCsv(logEntry);
     await logTradeToSQL(logEntry);
+  }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+async function run() {
+  checkOnboarding();
+  validateConfig();
+  initCsv();
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Claude Trading Bot — Multi-Strategy, Multi-Asset Edition");
+  console.log(`  ${new Date().toISOString()}`);
+  console.log(`  Mode:     ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
+  console.log(`  Assets:   ${CONFIG.symbols.join(", ")}`);
+  console.log(`  Active:   ${CONFIG.strategy} (executes orders)`);
+  console.log(`  Logging:  all 14 strategies × ${CONFIG.symbols.length} assets → trades.csv + Azure SQL`);
+  console.log("═══════════════════════════════════════════════════════════");
+
+  if (CONFIG.azureSQL.enabled) {
+    console.log(`\n── Azure SQL ─────────────────────────────────────────────\n`);
+    console.log(`  Server: ${CONFIG.azureSQL.server}`);
+    await initAzureSQL();
+  }
+
+  const log = loadLog();
+
+  for (const symbol of CONFIG.symbols) {
+    try {
+      await processSymbol(symbol, log);
+    } catch (err) {
+      console.error(`\n❌ Error processing ${symbol}: ${err.message}`);
+    }
   }
 
   saveLog(log);
