@@ -36,7 +36,9 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
   " 2>/dev/null | tr -d '\r')
   if [ -z "$PROXY_OK" ]; then
     echo "Setting up portproxy (requires admin)..."
-    powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File D:\projects_git\claude-tradingview-mcp-trading\scripts\setup_wsl_portproxy.ps1'"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    WIN_SCRIPT=$(wslpath -w "$SCRIPT_DIR/setup_wsl_portproxy.ps1")
+    powershell.exe -NoProfile -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy RemoteSigned -File \"$WIN_SCRIPT\"'"
     echo "Approve the UAC prompt, then wait a few seconds and run tv_health_check."
   else
     echo "Portproxy active on $WIN_HOST:$PORT → 127.0.0.1:$PORT"

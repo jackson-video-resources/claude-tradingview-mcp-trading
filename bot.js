@@ -110,6 +110,44 @@ const CONFIG = {
 
 const LOG_FILE = "safety-check-log.json";
 
+// ─── Config Validation ───────────────────────────────────────────────────────
+
+function validateConfig() {
+  const errors = [];
+
+  if (!Number.isFinite(CONFIG.portfolioValue) || CONFIG.portfolioValue <= 0)
+    errors.push("PORTFOLIO_VALUE_USD must be a positive number");
+
+  if (!Number.isFinite(CONFIG.maxTradeSizeUSD) || CONFIG.maxTradeSizeUSD <= 0)
+    errors.push("MAX_TRADE_SIZE_USD must be a positive number");
+
+  if (!Number.isInteger(CONFIG.maxTradesPerDay) || CONFIG.maxTradesPerDay <= 0)
+    errors.push("MAX_TRADES_PER_DAY must be a positive integer");
+
+  if (CONFIG.maxTradeSizeUSD > CONFIG.portfolioValue * 0.5)
+    errors.push("MAX_TRADE_SIZE_USD cannot exceed 50% of PORTFOLIO_VALUE_USD");
+
+  const validTimeframes = ["1m","3m","5m","15m","30m","1H","4H","1D","1W"];
+  if (!validTimeframes.includes(CONFIG.timeframe))
+    errors.push(`TIMEFRAME must be one of: ${validTimeframes.join(", ")}`);
+
+  if (!/^[A-Z]{2,20}$/.test(CONFIG.symbol))
+    errors.push("SYMBOL must be uppercase letters only (e.g. BTCUSDT)");
+
+  if (!["bitget","coinbase"].includes(CONFIG.exchange))
+    errors.push("EXCHANGE must be 'bitget' or 'coinbase'");
+
+  const bitgetBaseUrl = CONFIG.bitget.baseUrl;
+  if (!bitgetBaseUrl.startsWith("https://"))
+    errors.push("BITGET_BASE_URL must use HTTPS");
+
+  if (errors.length > 0) {
+    console.error("\n❌ Configuration errors:");
+    errors.forEach((e) => console.error(`   - ${e}`));
+    process.exit(1);
+  }
+}
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
@@ -138,19 +176,37 @@ async function fetchCandles(symbol, interval, limit = 200) {
     "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
     "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const binanceInterval = intervalMap[interval];
+  if (!binanceInterval) throw new Error(`Invalid interval: ${interval}`);
+
+  const safeSymbol = encodeURIComponent(symbol.replace(/[^A-Z0-9]/g, ""));
+  const url = `https://api.binance.com/api/v3/klines?symbol=${safeSymbol}&interval=${binanceInterval}&limit=${limit}`;
+
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+
   const data = await res.json();
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  if (!Array.isArray(data)) throw new Error("Binance API returned unexpected response type");
+
+  return data.map((k, idx) => {
+    if (!Array.isArray(k) || k.length < 6)
+      throw new Error(`Binance candle ${idx} has invalid structure`);
+
+    const time   = parseInt(k[0]);
+    const open   = parseFloat(k[1]);
+    const high   = parseFloat(k[2]);
+    const low    = parseFloat(k[3]);
+    const close  = parseFloat(k[4]);
+    const volume = parseFloat(k[5]);
+
+    if (![time, open, high, low, close, volume].every(Number.isFinite))
+      throw new Error(`Binance candle ${idx} contains non-finite values`);
+
+    if (high < low || high < open || high < close || low > open || low > close)
+      throw new Error(`Binance candle ${idx} has invalid OHLC: H=${high} L=${low} O=${open} C=${close}`);
+
+    return { time, open, high, low, close, volume };
+  });
 }
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
@@ -446,22 +502,31 @@ function signCoinbaseJWT(method, path) {
   const keyName = CONFIG.coinbase.apiKey;
   const privateKey = CONFIG.coinbase.secretKey.replace(/\\n/g, "\n");
 
+  const hasPEMHeader = privateKey.includes("BEGIN EC PRIVATE KEY") || privateKey.includes("BEGIN PRIVATE KEY");
+  const hasPEMFooter = privateKey.includes("END EC PRIVATE KEY") || privateKey.includes("END PRIVATE KEY");
+  if (!hasPEMHeader || !hasPEMFooter)
+    throw new Error("Invalid EC private key format — check BITGET_SECRET_KEY in .env");
+
   const header = Buffer.from(JSON.stringify({ alg: "ES256", typ: "JWT" })).toString("base64url");
   const now = Math.floor(Date.now() / 1000);
   const payload = Buffer.from(JSON.stringify({
     sub: keyName,
     iss: "cdp",
     nbf: now,
-    exp: now + 120,
+    exp: now + 30,
     uri: `${method} api.coinbase.com${path}`,
   })).toString("base64url");
 
   const signingInput = `${header}.${payload}`;
-  const sign = crypto.createSign("SHA256");
-  sign.update(signingInput);
-  sign.end();
-  const sig = sign.sign({ key: privateKey, format: "pem", type: "pkcs8" }, "base64url");
-  return `${signingInput}.${sig}`;
+  try {
+    const sign = crypto.createSign("SHA256");
+    sign.update(signingInput);
+    sign.end();
+    const sig = sign.sign({ key: privateKey, format: "pem", type: "pkcs8" }, "base64url");
+    return `${signingInput}.${sig}`;
+  } catch (err) {
+    throw new Error(`JWT signing failed — check BITGET_SECRET_KEY format`);
+  }
 }
 
 // Map Binance-style symbol (BTCUSDT) to Coinbase product_id (BTC-USD)
@@ -567,7 +632,7 @@ async function initAzureSQL() {
     `);
     console.log("  Azure SQL: trades table ready.");
   } catch (err) {
-    console.warn(`  Azure SQL init failed: ${err.message}`);
+    console.warn(`  Azure SQL init failed: ${err.message.split("\n")[0]}`);
   }
 }
 
@@ -634,7 +699,7 @@ async function logTradeToSQL(logEntry) {
 
     console.log("  Azure SQL: trade logged.");
   } catch (err) {
-    console.warn(`  Azure SQL insert failed: ${err.message}`);
+    console.warn(`  Azure SQL insert failed: ${err.message.split("\n")[0]}`);
   }
 }
 
@@ -697,12 +762,24 @@ function writeTradeCsv(logEntry) {
   }
 
   const exchangeName = CONFIG.exchange === "coinbase" ? "Coinbase Advanced" : "BitGet";
+
+  // RFC 4180 CSV escaping — prevents formula injection and malformed rows
+  const csvField = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    // Strip leading = + - @ to prevent spreadsheet formula injection
+    const safe = s.replace(/^[=+\-@]/, "'$&");
+    return safe.includes(",") || safe.includes('"') || safe.includes("\n")
+      ? `"${safe.replace(/"/g, '""')}"`
+      : safe;
+  };
+
   const row = [
     date, time, exchangeName, logEntry.symbol,
     logEntry.strategy, logEntry.signal,
     side, quantity, logEntry.price.toFixed(2),
-    totalUSD, fee, netAmount, orderId, mode, `"${notes}"`,
-  ].join(",");
+    totalUSD, fee, netAmount, orderId, mode, notes,
+  ].map(csvField).join(",");
 
   if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
@@ -749,6 +826,7 @@ function generateTaxSummary() {
 
 async function run() {
   checkOnboarding();
+  validateConfig();
   initCsv();
 
   console.log("═══════════════════════════════════════════════════════════");
