@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "mssql": "^12.2.1",
     "node-fetch": "^3.3.2"
   },
   "engines": {

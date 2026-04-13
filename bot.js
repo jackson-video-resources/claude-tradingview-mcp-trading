@@ -19,11 +19,12 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import sql from "mssql";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY"];
   const missing = required.filter((k) => !process.env[k]);
 
   if (!existsSync(".env")) {
@@ -86,11 +87,24 @@ const CONFIG = {
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   strategy: process.env.STRATEGY || "vwap_scalp",
+  exchange: (process.env.EXCHANGE || "bitget").toLowerCase(),
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
     passphrase: process.env.BITGET_PASSPHRASE,
     baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  },
+  coinbase: {
+    apiKey: process.env.BITGET_API_KEY,       // reuses same env vars
+    secretKey: process.env.BITGET_SECRET_KEY, // reuses same env vars
+    baseUrl: "https://api.coinbase.com",
+  },
+  azureSQL: {
+    server:   process.env.AZURE_SQL_SERVER,
+    database: process.env.AZURE_SQL_DATABASE,
+    user:     process.env.AZURE_SQL_USER,
+    password: process.env.AZURE_SQL_PASSWORD,
+    enabled:  !!(process.env.AZURE_SQL_SERVER && process.env.AZURE_SQL_DATABASE),
   },
 };
 
@@ -425,6 +439,209 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   return data.data;
 }
 
+// ─── Coinbase Advanced Execution ─────────────────────────────────────────────
+
+// Coinbase Advanced uses ES256 JWT auth — signed with the EC private key
+function signCoinbaseJWT(method, path) {
+  const keyName = CONFIG.coinbase.apiKey;
+  const privateKey = CONFIG.coinbase.secretKey.replace(/\\n/g, "\n");
+
+  const header = Buffer.from(JSON.stringify({ alg: "ES256", typ: "JWT" })).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(JSON.stringify({
+    sub: keyName,
+    iss: "cdp",
+    nbf: now,
+    exp: now + 120,
+    uri: `${method} api.coinbase.com${path}`,
+  })).toString("base64url");
+
+  const signingInput = `${header}.${payload}`;
+  const sign = crypto.createSign("SHA256");
+  sign.update(signingInput);
+  sign.end();
+  const sig = sign.sign({ key: privateKey, format: "pem", type: "pkcs8" }, "base64url");
+  return `${signingInput}.${sig}`;
+}
+
+// Map Binance-style symbol (BTCUSDT) to Coinbase product_id (BTC-USD)
+function toCoinbaseSymbol(symbol) {
+  // Common mappings — extend as needed
+  const map = {
+    BTCUSDT: "BTC-USD", ETHUSDT: "ETH-USD", SOLUSDT: "SOL-USD",
+    BNBUSDT: "BNB-USD", XRPUSDT: "XRP-USD", ADAUSDT: "ADA-USD",
+    DOGEUSDT: "DOGE-USD", AVAXUSDT: "AVAX-USD", MATICUSDT: "MATIC-USD",
+    LINKUSDT: "LINK-USD", DOTUSDT: "DOT-USD", LTCUSDT: "LTC-USD",
+  };
+  return map[symbol] || symbol.replace("USDT", "-USD");
+}
+
+async function placeCoinbaseOrder(symbol, side, sizeUSD, price) {
+  const productId = toCoinbaseSymbol(symbol);
+  const path = "/api/v3/brokerage/orders";
+  const jwt = signCoinbaseJWT("POST", path);
+
+  // Coinbase buy uses quote_size (USD), sell uses base_size (coin quantity)
+  const orderConfig = side === "buy"
+    ? { market_market_ioc: { quote_size: sizeUSD.toFixed(2) } }
+    : { market_market_ioc: { base_size: (sizeUSD / price).toFixed(8) } };
+
+  const body = JSON.stringify({
+    client_order_id: `claude-${Date.now()}`,
+    product_id: productId,
+    side: side.toUpperCase(),
+    order_configuration: orderConfig,
+  });
+
+  const res = await fetch(`${CONFIG.coinbase.baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${jwt}`,
+    },
+    body,
+  });
+
+  const data = await res.json();
+  if (!data.success) {
+    const reason = data.error_response?.message || data.error || JSON.stringify(data);
+    throw new Error(`Coinbase order failed: ${reason}`);
+  }
+  return { orderId: data.success_response?.order_id };
+}
+
+// ─── Order Dispatcher ─────────────────────────────────────────────────────────
+
+async function placeOrder(symbol, side, sizeUSD, price) {
+  if (CONFIG.exchange === "coinbase") {
+    return placeCoinbaseOrder(symbol, side, sizeUSD, price);
+  }
+  return placeBitGetOrder(symbol, side, sizeUSD, price);
+}
+
+// ─── Azure SQL Logging ───────────────────────────────────────────────────────
+
+let sqlPool = null;
+
+async function getPool() {
+  if (sqlPool) return sqlPool;
+  sqlPool = await sql.connect({
+    server: CONFIG.azureSQL.server,
+    database: CONFIG.azureSQL.database,
+    user: CONFIG.azureSQL.user,
+    password: CONFIG.azureSQL.password,
+    options: { encrypt: true, trustServerCertificate: false },
+    pool: { max: 3, min: 0, idleTimeoutMillis: 30000 },
+  });
+  return sqlPool;
+}
+
+async function initAzureSQL() {
+  if (!CONFIG.azureSQL.enabled) return;
+  try {
+    const pool = await getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_NAME = 'trades'
+      )
+      CREATE TABLE trades (
+        id            INT IDENTITY(1,1) PRIMARY KEY,
+        trade_date    DATE,
+        trade_time    TIME,
+        exchange      NVARCHAR(50),
+        symbol        NVARCHAR(20),
+        strategy      NVARCHAR(50),
+        signal        NVARCHAR(10),
+        side          NVARCHAR(10),
+        quantity      DECIMAL(18,8),
+        price         DECIMAL(18,2),
+        total_usd     DECIMAL(18,2),
+        fee_est       DECIMAL(18,4),
+        net_amount    DECIMAL(18,2),
+        order_id      NVARCHAR(100),
+        mode          NVARCHAR(20),
+        notes         NVARCHAR(500),
+        created_at    DATETIME2 DEFAULT GETUTCDATE()
+      )
+    `);
+    console.log("  Azure SQL: trades table ready.");
+  } catch (err) {
+    console.warn(`  Azure SQL init failed: ${err.message}`);
+  }
+}
+
+async function logTradeToSQL(logEntry) {
+  if (!CONFIG.azureSQL.enabled) return;
+  try {
+    const pool = await getPool();
+    const now = new Date(logEntry.timestamp);
+
+    let side = null, quantity = null, totalUSD = null, fee = null,
+        netAmount = null, orderId = null, mode, notes;
+
+    if (!logEntry.allPass) {
+      const failed = logEntry.conditions.filter((c) => !c.pass).map((c) => c.label).join("; ");
+      mode = "BLOCKED"; orderId = "BLOCKED";
+      notes = `Failed: ${failed}`;
+    } else if (logEntry.paperTrading) {
+      side = logEntry.signal === "long" ? "BUY" : "SELL";
+      quantity = logEntry.tradeSize / logEntry.price;
+      totalUSD = logEntry.tradeSize;
+      fee = logEntry.tradeSize * 0.001;
+      netAmount = logEntry.tradeSize - fee;
+      orderId = logEntry.orderId || null;
+      mode = "PAPER"; notes = "All conditions met";
+    } else {
+      side = logEntry.signal === "long" ? "BUY" : "SELL";
+      quantity = logEntry.tradeSize / logEntry.price;
+      totalUSD = logEntry.tradeSize;
+      fee = logEntry.tradeSize * 0.001;
+      netAmount = logEntry.tradeSize - fee;
+      orderId = logEntry.orderId || null;
+      mode = "LIVE";
+      notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
+    }
+
+    const exchangeName = CONFIG.exchange === "coinbase" ? "Coinbase Advanced" : "BitGet";
+
+    await pool.request()
+      .input("trade_date",  sql.Date,           now)
+      .input("trade_time",  sql.Time,            now)
+      .input("exchange",    sql.NVarChar(50),    exchangeName)
+      .input("symbol",      sql.NVarChar(20),    logEntry.symbol)
+      .input("strategy",    sql.NVarChar(50),    logEntry.strategy)
+      .input("signal",      sql.NVarChar(10),    logEntry.signal)
+      .input("side",        sql.NVarChar(10),    side)
+      .input("quantity",    sql.Decimal(18,8),   quantity)
+      .input("price",       sql.Decimal(18,2),   logEntry.price)
+      .input("total_usd",   sql.Decimal(18,2),   totalUSD)
+      .input("fee_est",     sql.Decimal(18,4),   fee)
+      .input("net_amount",  sql.Decimal(18,2),   netAmount)
+      .input("order_id",    sql.NVarChar(100),   orderId)
+      .input("mode",        sql.NVarChar(20),    mode)
+      .input("notes",       sql.NVarChar(500),   notes)
+      .query(`
+        INSERT INTO trades
+          (trade_date, trade_time, exchange, symbol, strategy, signal,
+           side, quantity, price, total_usd, fee_est, net_amount,
+           order_id, mode, notes)
+        VALUES
+          (@trade_date, @trade_time, @exchange, @symbol, @strategy, @signal,
+           @side, @quantity, @price, @total_usd, @fee_est, @net_amount,
+           @order_id, @mode, @notes)
+      `);
+
+    console.log("  Azure SQL: trade logged.");
+  } catch (err) {
+    console.warn(`  Azure SQL insert failed: ${err.message}`);
+  }
+}
+
+async function closeSQLPool() {
+  if (sqlPool) { await sql.close(); sqlPool = null; }
+}
+
 // ─── CSV Logging ─────────────────────────────────────────────────────────────
 
 const CSV_FILE = "trades.csv";
@@ -479,8 +696,9 @@ function writeTradeCsv(logEntry) {
     notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
   }
 
+  const exchangeName = CONFIG.exchange === "coinbase" ? "Coinbase Advanced" : "BitGet";
   const row = [
-    date, time, "BitGet", logEntry.symbol,
+    date, time, exchangeName, logEntry.symbol,
     logEntry.strategy, logEntry.signal,
     side, quantity, logEntry.price.toFixed(2),
     totalUSD, fee, netAmount, orderId, mode, `"${notes}"`,
@@ -541,6 +759,12 @@ async function run() {
   console.log(`  Active:   ${CONFIG.strategy} (executes orders)`);
   console.log(`  Logging:  all 4 strategies → trades.csv`);
   console.log("═══════════════════════════════════════════════════════════");
+
+  if (CONFIG.azureSQL.enabled) {
+    console.log(`\n── Azure SQL ─────────────────────────────────────────────\n`);
+    console.log(`  Server: ${CONFIG.azureSQL.server}`);
+    await initAzureSQL();
+  }
 
   const log = loadLog();
 
@@ -642,7 +866,7 @@ async function run() {
         const side = s.signal === "long" ? "buy" : "sell";
         console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${CONFIG.symbol}`);
         try {
-          const order = await placeBitGetOrder(CONFIG.symbol, side, tradeSize, price);
+          const order = await placeOrder(CONFIG.symbol, side, tradeSize, price);
           logEntry.orderPlaced = true;
           logEntry.orderId = order.orderId;
           console.log(`✅ ORDER PLACED — ${order.orderId}`);
@@ -655,9 +879,11 @@ async function run() {
 
     log.trades.push(logEntry);
     writeTradeCsv(logEntry);
+    await logTradeToSQL(logEntry);
   }
 
   saveLog(log);
+  await closeSQLPool();
   console.log(`\nDecision log saved → ${LOG_FILE}`);
   console.log("═══════════════════════════════════════════════════════════\n");
 }
