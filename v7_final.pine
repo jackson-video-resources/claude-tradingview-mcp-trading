@@ -1,0 +1,682 @@
+//@version=6
+strategy("Tom Hougaard — Funded Sim v7 SNIPER 3TF", overlay=true,
+     initial_capital=9200,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=2,
+     calc_on_every_tick=true,
+     pyramiding=3,
+     close_entries_rule="ANY")
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ v7 SNIPER 3TF — RUN ON 1H CHART (XAUUSD)                                  ║
+// ║                                                                            ║
+// ║   Daily   = macro structure (HH/HL or LL/LH)                              ║
+// ║   4H      = HTF filters (EMA200, EMA20, VWAP, slope) — via security()     ║
+// ║   1H      = execution timeframe (entry trigger, ORB, pyramid)             ║
+// ║   15m     = LTF precision entry (rejection scanner, tight stops)          ║
+// ║                                                                            ║
+// ║ This is the full Tom Hougaard methodology in code:                        ║
+// ║   "Identify level on HTF. Drop to LTF. Wait for reaction. Snipe."         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+htf_tf            = input.timeframe("240", "HTF for Trend Context",       group="3TF Stack")
+ltf_tf            = input.timeframe("15",  "LTF for Precision Entry",     group="3TF Stack")
+use_ltf_precision = input.bool(true,       "Use LTF Stop & Entry",       group="3TF Stack")
+ltf_stop_buffer   = input.float(0.1,       "LTF Stop Buffer (ATR mult)", group="3TF Stack", step=0.05)
+
+use_sniper_pullback  = input.bool(true,  "Sniper T1: Limit at Pullback",         group="Sniper Entries")
+pullback_fib         = input.float(0.5,  "Pullback Fib Level",                   group="Sniper Entries", step=0.05, minval=0.3, maxval=0.8)
+pullback_max_bars    = input.int(8,      "Cancel Setup In X Bars (1H bars)",     group="Sniper Entries", minval=2, maxval=24)
+use_failed_breakout  = input.bool(false, "Sniper T3: Failed-Breakout Reversal",  group="Sniper Entries")
+sniper_stop_buffer   = input.float(0.3,  "Fallback Stop Buffer (ATR mult)",      group="Sniper Entries", step=0.1)
+
+ema20_len         = input.int(20,    "EMA 20 Length (HTF)",             group="Filters")
+ema_len           = input.int(200,   "EMA 200 Length (HTF)",            group="Filters")
+ema_slope_bars    = input.int(5,     "EMA Slope Bars (HTF)",            group="Filters")
+range_expand_x    = input.float(1.1, "Range Expansion x avg",           group="Filters", step=0.1)
+strong_candle_pct = input.float(0.55,"Strong Candle Body %",            group="Filters", step=0.05)
+use_vwap_filter   = input.bool(true, "Use VWAP Filter (HTF)",           group="Filters")
+mom_thresh        = input.float(0.10,"Momentum % Threshold",            group="Filters", step=0.05)
+daily_lookback    = input.int(5,     "Daily Structure Lookback Days",   group="Daily Structure", minval=2)
+
+use_orb           = input.bool(true, "Enable ORB",                      group="ORB")
+london_orb        = input.string("1000-1100", "London ORB Window (EAT)", group="ORB")
+ny_orb            = input.string("1500-1600", "NY ORB Window (EAT)",     group="ORB")
+
+atr_len           = input.int(14,    "ATR Length",                      group="Risk")
+sl_mult           = input.float(1.0, "Fallback SL Multiplier (ATR)",    group="Risk", step=0.1)
+initial_size_pct  = input.float(15,  "Initial Position Size %",         group="Risk", step=5)
+pyramid_size_pct  = input.float(10,  "Each Pyramid Add Size %",         group="Risk", step=5)
+tp1_r             = input.float(2.0, "TP1 Reward (R)",                  group="Risk", step=0.5)
+tp1_close_pct     = input.float(50,  "TP1 Close % of Position",         group="Risk", step=5)
+tp2_r             = input.float(4.0, "TP2 Reward (R)",                  group="Risk", step=0.5)
+tp2_close_pct     = input.float(30,  "TP2 Close % of Position",         group="Risk", step=5)
+pyramid_1_r       = input.float(1.0, "Pyramid Add 1 (R)",               group="Pyramid", step=0.5)
+pyramid_2_r       = input.float(2.0, "Pyramid Add 2 (R)",               group="Pyramid", step=0.5)
+
+london_session    = input.string("1000-1500", "London Session (EAT)",   group="Time")
+ny_session        = input.string("1500-2000", "NY Session (EAT)",       group="Time")
+use_round_filter  = input.bool(true, "Avoid Round Numbers",             group="Round Numbers")
+round_increment   = input.float(50,  "Round Increment $",               group="Round Numbers")
+round_buffer      = input.float(5,   "Avoid Within $",                  group="Round Numbers")
+use_loss_lockout  = input.bool(true, "Daily 2-Loss Lockout",            group="Risk Discipline")
+
+acct_start        = input.float(9200, "Account Starting $",             group="Funded Account")
+daily_dd_limit    = input.float(500,  "Max Daily Loss $",               group="Funded Account")
+max_total_dd      = input.float(1000, "Max Total Drawdown $",           group="Funded Account")
+profit_target     = input.float(800,  "Profit Target $",                group="Funded Account")
+sim_start         = input.time(timestamp("2023-01-01"), "Sim Start Date", group="Funded Account")
+fri_close_hour    = input.int(20,     "Fri Force-Close Hour (EAT)",     group="Funded Account", minval=16, maxval=23)
+
+ph_left           = input.int(8,     "Pivot High Bars Left",            group="Structure")
+ph_right          = input.int(4,     "Pivot High Bars Right",           group="Structure")
+pl_left           = input.int(8,     "Pivot Low Bars Left",             group="Structure")
+pl_right          = input.int(4,     "Pivot Low Bars Right",            group="Structure")
+show_swings       = input.bool(true, "Show Swings",                     group="Structure")
+sel_sig           = input.int(0,     "Inspect Signal #",                group="Dashboard", minval=0)
+
+// ─── HTF CONTEXT (from 4H via security) ──────────────────────────────────────
+htf_ema200    = request.security(syminfo.tickerid, htf_tf, ta.ema(close, ema_len),  lookahead=barmerge.lookahead_off)
+htf_ema20     = request.security(syminfo.tickerid, htf_tf, ta.ema(close, ema20_len), lookahead=barmerge.lookahead_off)
+htf_ema_prior = request.security(syminfo.tickerid, htf_tf, ta.ema(close, ema_len)[ema_slope_bars], lookahead=barmerge.lookahead_off)
+htf_vwap      = request.security(syminfo.tickerid, htf_tf, ta.vwap, lookahead=barmerge.lookahead_off)
+htf_atr       = request.security(syminfo.tickerid, htf_tf, ta.atr(atr_len), lookahead=barmerge.lookahead_off)
+htf_close     = request.security(syminfo.tickerid, htf_tf, close, lookahead=barmerge.lookahead_off)
+
+ema_rising  = htf_ema200 > htf_ema_prior
+ema_falling = htf_ema200 < htf_ema_prior
+
+// ─── EXECUTION-TF INDICATORS (1H) ─────────────────────────────────────────────
+ema20_local = ta.ema(close, ema20_len)
+atr_val     = ta.atr(atr_len)
+rsi_val     = ta.rsi(close, 14)
+vwap_local  = ta.vwap
+
+bar_range    = high - low
+avg_range    = ta.sma(bar_range, 20)
+range_expand = bar_range > avg_range * range_expand_x
+
+candle_pos   = (close - low) / math.max(bar_range, syminfo.mintick)
+strong_bull  = candle_pos >= strong_candle_pct
+strong_bear  = candle_pos <= (1 - strong_candle_pct)
+
+// VWAP filter uses HTF VWAP (4H is more meaningful than 1H VWAP)
+vwap_ok_long  = not use_vwap_filter or close > htf_vwap
+vwap_ok_short = not use_vwap_filter or close < htf_vwap
+
+// HTF EMA filters
+htf_ema20_ok_long  = close > htf_ema20
+htf_ema20_ok_short = close < htf_ema20
+
+mom    = (close - close[1]) / close[1] * 100
+mom_ok = math.abs(mom) >= mom_thresh
+
+// 1H confirmation candles
+body_size_1h    = math.abs(close - open)
+upper_wick_1h   = high - math.max(close, open)
+lower_wick_1h   = math.min(close, open) - low
+bull_pin_1h     = lower_wick_1h > body_size_1h * 2 and upper_wick_1h < body_size_1h and close > open
+bull_engulf_1h  = close > open and close > high[1] and open <= close[1]
+bear_pin_1h     = upper_wick_1h > body_size_1h * 2 and lower_wick_1h < body_size_1h and close < open
+bear_engulf_1h  = close < open and close < low[1] and open >= close[1]
+
+// ─── LTF DATA (15m within 1H) ─────────────────────────────────────────────────
+ltf_highs  = request.security_lower_tf(syminfo.tickerid, ltf_tf, high)
+ltf_lows   = request.security_lower_tf(syminfo.tickerid, ltf_tf, low)
+ltf_opens  = request.security_lower_tf(syminfo.tickerid, ltf_tf, open)
+ltf_closes = request.security_lower_tf(syminfo.tickerid, ltf_tf, close)
+
+scan_ltf_long_rejection(level) =>
+    var bool found = false
+    var float wick = na
+    var float rej_close = na
+    found := false
+    wick := na
+    rej_close := na
+    n_ltf = array.size(ltf_lows)
+    if n_ltf > 0
+        for i = 0 to n_ltf - 1
+            l = array.get(ltf_lows, i)
+            o = array.get(ltf_opens, i)
+            c = array.get(ltf_closes, i)
+            tested  = l <= level
+            bullish = c > o and c > level
+            body = math.abs(c - o)
+            l_wick = math.min(c, o) - l
+            quality = l_wick > body * 1.2 or (c - level) > (high - low) * 0.3
+            if tested and bullish and quality and not found
+                found := true
+                wick := l
+                rej_close := c
+    [found, wick, rej_close]
+
+scan_ltf_short_rejection(level) =>
+    var bool found = false
+    var float wick = na
+    var float rej_close = na
+    found := false
+    wick := na
+    rej_close := na
+    n_ltf = array.size(ltf_highs)
+    if n_ltf > 0
+        for i = 0 to n_ltf - 1
+            o = array.get(ltf_opens, i)
+            c = array.get(ltf_closes, i)
+            h = array.get(ltf_highs, i)
+            tested  = h >= level
+            bearish = c < o and c < level
+            body = math.abs(c - o)
+            u_wick = h - math.max(c, o)
+            quality = u_wick > body * 1.2 or (level - c) > (high - low) * 0.3
+            if tested and bearish and quality and not found
+                found := true
+                wick := h
+                rej_close := c
+    [found, wick, rej_close]
+
+// ─── DAILY MACRO STRUCTURE ────────────────────────────────────────────────────
+d_high  = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+d_low   = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+
+var d_highs = array.new_float(0)
+var d_lows  = array.new_float(0)
+day_changed = ta.change(time("D")) != 0
+if day_changed and not na(d_high)
+    array.push(d_highs, d_high)
+    array.push(d_lows, d_low)
+    if array.size(d_highs) > daily_lookback
+        array.shift(d_highs)
+        array.shift(d_lows)
+
+daily_struct_bull = false
+daily_struct_bear = false
+if array.size(d_highs) >= 2
+    last_h = array.get(d_highs, array.size(d_highs) - 1)
+    prev_h = array.get(d_highs, array.size(d_highs) - 2)
+    last_l = array.get(d_lows,  array.size(d_lows)  - 1)
+    prev_l = array.get(d_lows,  array.size(d_lows)  - 2)
+    daily_struct_bull := last_h > prev_h or last_l > prev_l
+    daily_struct_bear := last_l < prev_l or last_h < prev_h
+
+// ─── 1H STRUCTURE PIVOTS ──────────────────────────────────────────────────────
+ph = ta.pivothigh(high, ph_left, ph_right)
+pl = ta.pivotlow(low,   pl_left, pl_right)
+var float last_ph = na
+var float last_pl = na
+var float prev_ph = na
+var float prev_pl = na
+if not na(ph)
+    prev_ph := last_ph
+    last_ph := ph
+if not na(pl)
+    prev_pl := last_pl
+    last_pl := pl
+structure_bull = not na(last_ph) and not na(last_pl) and close > last_pl
+structure_bear = not na(last_ph) and not na(last_pl) and close < last_ph
+
+// ─── SESSION / FRIDAY CLOSE ───────────────────────────────────────────────────
+TZ_EAT     = "Africa/Nairobi"
+in_london  = not na(time(timeframe.period, london_session, TZ_EAT))
+in_ny      = not na(time(timeframe.period, ny_session,     TZ_EAT))
+in_session = in_london or in_ny
+
+bar_hour    = hour(time, TZ_EAT)
+bar_dow     = dayofweek(time, TZ_EAT)
+is_friday   = bar_dow == dayofweek.friday
+force_close = is_friday and bar_hour >= fri_close_hour and strategy.position_size != 0
+if force_close
+    strategy.close_all(comment="Fri Close")
+no_new_fri = is_friday and bar_hour >= fri_close_hour
+
+// ─── ORB ──────────────────────────────────────────────────────────────────────
+in_london_orb = not na(time(timeframe.period, london_orb, TZ_EAT))
+in_ny_orb     = not na(time(timeframe.period, ny_orb,     TZ_EAT))
+
+var float ld_orb_high = na
+var float ld_orb_low  = na
+var float ny_orb_high = na
+var float ny_orb_low  = na
+
+if day_changed
+    ld_orb_high := na
+    ld_orb_low  := na
+    ny_orb_high := na
+    ny_orb_low  := na
+
+if in_london_orb
+    ld_orb_high := na(ld_orb_high) ? high : math.max(ld_orb_high, high)
+    ld_orb_low  := na(ld_orb_low)  ? low  : math.min(ld_orb_low,  low)
+if in_ny_orb
+    ny_orb_high := na(ny_orb_high) ? high : math.max(ny_orb_high, high)
+    ny_orb_low  := na(ny_orb_low)  ? low  : math.min(ny_orb_low,  low)
+
+ld_orb_long  = use_orb and not in_london_orb and not na(ld_orb_high) and close > ld_orb_high
+ld_orb_short = use_orb and not in_london_orb and not na(ld_orb_low)  and close < ld_orb_low
+ny_orb_long  = use_orb and not in_ny_orb     and not na(ny_orb_high) and close > ny_orb_high
+ny_orb_short = use_orb and not in_ny_orb     and not na(ny_orb_low)  and close < ny_orb_low
+
+var bool ld_broke_above = false
+var bool ld_broke_below = false
+var bool ny_broke_above = false
+var bool ny_broke_below = false
+if day_changed
+    ld_broke_above := false
+    ld_broke_below := false
+    ny_broke_above := false
+    ny_broke_below := false
+if not na(ld_orb_high) and high > ld_orb_high
+    ld_broke_above := true
+if not na(ld_orb_low) and low < ld_orb_low
+    ld_broke_below := true
+if not na(ny_orb_high) and high > ny_orb_high
+    ny_broke_above := true
+if not na(ny_orb_low) and low < ny_orb_low
+    ny_broke_below := true
+
+fb_long_sig  = use_failed_breakout and ((ld_broke_below and close > ld_orb_low) or (ny_broke_below and close > ny_orb_low)) and daily_struct_bull
+fb_short_sig = use_failed_breakout and ((ld_broke_above and close < ld_orb_high) or (ny_broke_above and close < ny_orb_high)) and daily_struct_bear
+
+round_dist = math.abs(close - math.round(close / round_increment) * round_increment)
+not_at_round = not use_round_filter or round_dist > round_buffer
+
+// ─── ACCOUNT GATES ────────────────────────────────────────────────────────────
+day_change_t = ta.change(time("D"))
+is_new_day   = not na(day_change_t) and day_change_t != 0
+var float day_open_equity = strategy.equity
+if is_new_day
+    day_open_equity := strategy.equity
+daily_dd_used = day_open_equity - strategy.equity
+daily_dd_ok   = daily_dd_used < daily_dd_limit
+
+dd_floor    = acct_start - max_total_dd
+total_dd_ok = strategy.equity > dd_floor
+after_start = time >= sim_start
+net_pnl     = strategy.equity - acct_start
+var bool target_hit = false
+if net_pnl >= profit_target
+    target_hit := true
+
+var bool day_locked   = false
+var int  losses_today = 0
+if is_new_day
+    day_locked   := false
+    losses_today := 0
+var int last_closed_count = 0
+if strategy.closedtrades > last_closed_count
+    new_trades = strategy.closedtrades - last_closed_count
+    for i = 0 to new_trades - 1
+        idx = strategy.closedtrades - 1 - i
+        if strategy.closedtrades.profit(idx) < 0
+            losses_today += 1
+    last_closed_count := strategy.closedtrades
+if use_loss_lockout and losses_today >= 2
+    day_locked := true
+
+can_trade = after_start and daily_dd_ok and total_dd_ok and not target_hit and not no_new_fri and not day_locked
+
+// ─── SIGNAL ARRAYS / TRADE STATE ──────────────────────────────────────────────
+var sig_t    = array.new_int(0)
+var sig_ep   = array.new_float(0)
+var sig_sl_a = array.new_float(0)
+var sig_tp_a = array.new_float(0)
+var sig_risk = array.new_float(0)
+var sig_cnt  = array.new_int(0)
+var sig_dir  = array.new_string(0)
+var sig_type = array.new_string(0)
+var int total_sigs = 0
+
+var float entry_ep    = na
+var float entry_risk  = na
+var bool  be_moved    = false
+var int   pyramid_cnt = 0
+var bool  tp1_hit     = false
+var bool  tp2_hit     = false
+var int   last_sig_bar = -1
+sig_freshness_bars = 24  // show fired signal for ~1 day on 1H
+
+// ─── RAW TRIGGERS (using HTF EMAs + 1H structure) ────────────────────────────
+trend_long_sig  = in_session and ema_rising  and daily_struct_bull and htf_ema20_ok_long  and vwap_ok_long  and range_expand and strong_bull and structure_bull and not_at_round and mom_ok and can_trade and strategy.position_size == 0
+trend_short_sig = in_session and ema_falling and daily_struct_bear and htf_ema20_ok_short and vwap_ok_short and range_expand and strong_bear and structure_bear and not_at_round and mom_ok and can_trade and strategy.position_size == 0
+orb_long_sig    = (ld_orb_long  or ny_orb_long)  and daily_struct_bull and not_at_round and can_trade and strategy.position_size == 0
+orb_short_sig   = (ld_orb_short or ny_orb_short) and daily_struct_bear and not_at_round and can_trade and strategy.position_size == 0
+
+// ─── SETUP STATE ──────────────────────────────────────────────────────────────
+var bool   setup_armed       = false
+var string setup_dir         = ""
+var string setup_type        = ""
+var float  setup_limit_price = na
+var float  setup_stop_price  = na
+var int    setup_bars_left   = 0
+
+if setup_armed
+    setup_bars_left := setup_bars_left - 1
+    if setup_bars_left <= 0
+        setup_armed := false
+
+if setup_armed and setup_dir == "LONG" and close < setup_stop_price
+    setup_armed := false
+if setup_armed and setup_dir == "SHORT" and close > setup_stop_price
+    setup_armed := false
+
+if (trend_long_sig or orb_long_sig) and not setup_armed and use_sniper_pullback
+    setup_armed       := true
+    setup_dir         := "LONG"
+    setup_type        := orb_long_sig ? "ORB" : "TREND"
+    setup_limit_price := high - (high - low) * pullback_fib
+    setup_stop_price  := low - atr_val * sniper_stop_buffer
+    setup_bars_left   := pullback_max_bars
+
+if (trend_short_sig or orb_short_sig) and not setup_armed and use_sniper_pullback
+    setup_armed       := true
+    setup_dir         := "SHORT"
+    setup_type        := orb_short_sig ? "ORB" : "TREND"
+    setup_limit_price := low + (high - low) * pullback_fib
+    setup_stop_price  := high + atr_val * sniper_stop_buffer
+    setup_bars_left   := pullback_max_bars
+
+// ─── ENTRY DECISION ───────────────────────────────────────────────────────────
+long_pullback_hit  = setup_armed and setup_dir == "LONG"  and low  <= setup_limit_price
+short_pullback_hit = setup_armed and setup_dir == "SHORT" and high >= setup_limit_price
+
+[ltf_long_ok,  ltf_long_wick,  ltf_long_close]  = scan_ltf_long_rejection(setup_limit_price)
+[ltf_short_ok, ltf_short_wick, ltf_short_close] = scan_ltf_short_rejection(setup_limit_price)
+
+sniper_long_entry  = long_pullback_hit  and (use_ltf_precision ? ltf_long_ok  : true)
+sniper_short_entry = short_pullback_hit and (use_ltf_precision ? ltf_short_ok : true)
+
+direct_long_entry  = not use_sniper_pullback and (trend_long_sig  or orb_long_sig)
+direct_short_entry = not use_sniper_pullback and (trend_short_sig or orb_short_sig)
+
+final_long_entry  = (sniper_long_entry  or direct_long_entry  or fb_long_sig)  and can_trade and strategy.position_size == 0
+final_short_entry = (sniper_short_entry or direct_short_entry or fb_short_sig) and can_trade and strategy.position_size == 0
+
+qty_for_pct(pct) =>
+    raw_qty = strategy.equity * pct / 100 / close
+    math.max(raw_qty, 0.01)
+
+if final_long_entry
+    is_sniper = sniper_long_entry
+    is_fb     = fb_long_sig and not is_sniper
+    use_ltf   = is_sniper and use_ltf_precision and ltf_long_ok
+    actual_entry = use_ltf ? ltf_long_close : (is_sniper ? setup_limit_price : close)
+    actual_stop  = use_ltf ? (ltf_long_wick - atr_val * ltf_stop_buffer) : (is_sniper ? setup_stop_price : (is_fb ? math.min(ld_orb_low, ny_orb_low) - atr_val * 0.3 : close - atr_val * sl_mult))
+    risk_per_unit = actual_entry - actual_stop
+    type_str = is_fb ? "FB" : (use_ltf ? (setup_type + "-3TF") : (is_sniper ? (setup_type + "-S") : (orb_long_sig ? "ORB" : "TREND")))
+    be_moved    := false
+    entry_ep    := actual_entry
+    entry_risk  := risk_per_unit
+    pyramid_cnt := 0
+    tp1_hit     := false
+    tp2_hit     := false
+    total_sigs  += 1
+    array.push(sig_t,    time)
+    array.push(sig_ep,   actual_entry)
+    array.push(sig_sl_a, actual_stop)
+    array.push(sig_tp_a, actual_entry + risk_per_unit * tp2_r)
+    array.push(sig_risk, risk_per_unit)
+    array.push(sig_cnt,  total_sigs)
+    array.push(sig_dir,  "LONG")
+    array.push(sig_type, type_str)
+    setup_armed := false
+    last_sig_bar := bar_index
+    strategy.entry("L0", strategy.long, qty=qty_for_pct(initial_size_pct))
+    strategy.exit("L0-SL", "L0", stop=actual_stop)
+    label.new(bar_index, low - atr_val * 0.5, "▲ " + str.tostring(total_sigs) + " " + type_str, style=label.style_none, textcolor=color.new(color.lime, 0), size=size.tiny, yloc=yloc.price)
+    alert("BUY #" + str.tostring(total_sigs) + " (" + type_str + ") | E:" + str.tostring(actual_entry, "#.00") + " SL:" + str.tostring(actual_stop, "#.00") + " Risk:" + str.tostring(risk_per_unit, "#.00") + "pts TP2:" + str.tostring(actual_entry + risk_per_unit * tp2_r, "#.00"), alert.freq_once_per_bar)
+
+if final_short_entry
+    is_sniper = sniper_short_entry
+    is_fb     = fb_short_sig and not is_sniper
+    use_ltf   = is_sniper and use_ltf_precision and ltf_short_ok
+    actual_entry = use_ltf ? ltf_short_close : (is_sniper ? setup_limit_price : close)
+    actual_stop  = use_ltf ? (ltf_short_wick + atr_val * ltf_stop_buffer) : (is_sniper ? setup_stop_price : (is_fb ? math.max(ld_orb_high, ny_orb_high) + atr_val * 0.3 : close + atr_val * sl_mult))
+    risk_per_unit = actual_stop - actual_entry
+    type_str = is_fb ? "FB" : (use_ltf ? (setup_type + "-3TF") : (is_sniper ? (setup_type + "-S") : (orb_short_sig ? "ORB" : "TREND")))
+    be_moved    := false
+    entry_ep    := actual_entry
+    entry_risk  := risk_per_unit
+    pyramid_cnt := 0
+    tp1_hit     := false
+    tp2_hit     := false
+    total_sigs  += 1
+    array.push(sig_t,    time)
+    array.push(sig_ep,   actual_entry)
+    array.push(sig_sl_a, actual_stop)
+    array.push(sig_tp_a, actual_entry - risk_per_unit * tp2_r)
+    array.push(sig_risk, risk_per_unit)
+    array.push(sig_cnt,  total_sigs)
+    array.push(sig_dir,  "SHORT")
+    array.push(sig_type, type_str)
+    setup_armed := false
+    last_sig_bar := bar_index
+    strategy.entry("S0", strategy.short, qty=qty_for_pct(initial_size_pct))
+    strategy.exit("S0-SL", "S0", stop=actual_stop)
+    label.new(bar_index, high + atr_val * 0.5, "▼ " + str.tostring(total_sigs) + " " + type_str, style=label.style_none, textcolor=color.new(color.red, 0), size=size.tiny, yloc=yloc.price)
+    alert("SELL #" + str.tostring(total_sigs) + " (" + type_str + ") | E:" + str.tostring(actual_entry, "#.00") + " SL:" + str.tostring(actual_stop, "#.00") + " Risk:" + str.tostring(risk_per_unit, "#.00") + "pts TP2:" + str.tostring(actual_entry - risk_per_unit * tp2_r, "#.00"), alert.freq_once_per_bar)
+
+// ─── PYRAMID + EXITS ──────────────────────────────────────────────────────────
+if strategy.position_size > 0 and not na(entry_ep) and pyramid_cnt < 1
+    if high >= entry_ep + entry_risk * pyramid_1_r
+        pyramid_cnt := 1
+        strategy.entry("L1", strategy.long, qty=qty_for_pct(pyramid_size_pct))
+        strategy.exit("L1-SL", "L1", stop=entry_ep - entry_risk)
+if strategy.position_size > 0 and not na(entry_ep) and pyramid_cnt < 2
+    if high >= entry_ep + entry_risk * pyramid_2_r
+        pyramid_cnt := 2
+        be_moved    := true
+        tp1_hit     := true
+        strategy.close("L0", qty_percent=tp1_close_pct, comment="TP1")
+        strategy.entry("L2", strategy.long, qty=qty_for_pct(pyramid_size_pct))
+        strategy.exit("L0-BE", "L0", stop=entry_ep)
+        strategy.exit("L1-BE", "L1", stop=entry_ep)
+        strategy.exit("L2-BE", "L2", stop=entry_ep)
+if strategy.position_size > 0 and not na(entry_ep) and tp1_hit and not tp2_hit
+    if high >= entry_ep + entry_risk * tp2_r
+        tp2_hit := true
+        strategy.close("L0", qty_percent=tp2_close_pct, comment="TP2")
+        strategy.close("L1", qty_percent=tp2_close_pct, comment="TP2")
+        strategy.close("L2", qty_percent=tp2_close_pct, comment="TP2")
+if strategy.position_size > 0 and tp2_hit and close < ema20_local
+    strategy.close_all(comment="EMA20 trail")
+
+if strategy.position_size < 0 and not na(entry_ep) and pyramid_cnt < 1
+    if low <= entry_ep - entry_risk * pyramid_1_r
+        pyramid_cnt := 1
+        strategy.entry("S1", strategy.short, qty=qty_for_pct(pyramid_size_pct))
+        strategy.exit("S1-SL", "S1", stop=entry_ep + entry_risk)
+if strategy.position_size < 0 and not na(entry_ep) and pyramid_cnt < 2
+    if low <= entry_ep - entry_risk * pyramid_2_r
+        pyramid_cnt := 2
+        be_moved    := true
+        tp1_hit     := true
+        strategy.close("S0", qty_percent=tp1_close_pct, comment="TP1")
+        strategy.entry("S2", strategy.short, qty=qty_for_pct(pyramid_size_pct))
+        strategy.exit("S0-BE", "S0", stop=entry_ep)
+        strategy.exit("S1-BE", "S1", stop=entry_ep)
+        strategy.exit("S2-BE", "S2", stop=entry_ep)
+if strategy.position_size < 0 and not na(entry_ep) and tp1_hit and not tp2_hit
+    if low <= entry_ep - entry_risk * tp2_r
+        tp2_hit := true
+        strategy.close("S0", qty_percent=tp2_close_pct, comment="TP2")
+        strategy.close("S1", qty_percent=tp2_close_pct, comment="TP2")
+        strategy.close("S2", qty_percent=tp2_close_pct, comment="TP2")
+if strategy.position_size < 0 and tp2_hit and close > ema20_local
+    strategy.close_all(comment="EMA20 trail")
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+plotshape(final_long_entry,  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), size=size.small, title="Buy")
+plotshape(final_short_entry, style=shape.triangledown, location=location.abovebar, color=color.new(color.red,  0), size=size.small, title="Sell")
+plotshape(force_close,       style=shape.xcross,       location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, title="Fri Close")
+plotshape(final_long_entry  and use_ltf_precision and ltf_long_ok,  style=shape.diamond, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, title="3TF Long")
+plotshape(final_short_entry and use_ltf_precision and ltf_short_ok, style=shape.diamond, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, title="3TF Short")
+
+plot(htf_ema200, color=color.new(color.orange, 30), linewidth=2, title="HTF EMA 200")
+plot(htf_ema20,  color=color.new(color.aqua,   30), linewidth=1, title="HTF EMA 20")
+plot(htf_vwap,   color=color.new(color.yellow, 30), linewidth=1, title="HTF VWAP")
+plot(ema20_local, color=color.new(color.aqua, 60), linewidth=1, title="1H EMA 20 (trail)")
+
+plot(use_orb ? ld_orb_high : na, color=color.new(#00bfff, 30), linewidth=1, style=plot.style_circles, title="LD ORB H")
+plot(use_orb ? ld_orb_low  : na, color=color.new(#00bfff, 30), linewidth=1, style=plot.style_circles, title="LD ORB L")
+plot(use_orb ? ny_orb_high : na, color=color.new(#ff8c00, 30), linewidth=1, style=plot.style_circles, title="NY ORB H")
+plot(use_orb ? ny_orb_low  : na, color=color.new(#ff8c00, 30), linewidth=1, style=plot.style_circles, title="NY ORB L")
+plot(setup_armed ? setup_limit_price : na, color=color.new(color.yellow, 0), linewidth=2, style=plot.style_circles, title="Sniper Limit")
+plot(setup_armed ? setup_stop_price : na,  color=color.new(color.red, 0),    linewidth=2, style=plot.style_circles, title="Sniper Stop")
+
+if show_swings and not na(ph)
+    ph_lbl = na(prev_ph) ? "H" : ph > prev_ph ? "HH" : "LH"
+    ph_col = ph_lbl == "HH" ? color.new(#00bfff, 0) : color.new(#ff4757, 0)
+    label.new(bar_index - ph_right, ph, ph_lbl, style=label.style_label_down, color=ph_col, textcolor=color.white, size=size.tiny)
+if show_swings and not na(pl)
+    pl_lbl = na(prev_pl) ? "L" : pl > prev_pl ? "HL" : "LL"
+    pl_col = pl_lbl == "HL" ? color.new(#00ff88, 0) : color.new(#ff4757, 20)
+    label.new(bar_index - pl_right, pl, pl_lbl, style=label.style_label_up, color=pl_col, textcolor=color.white, size=size.tiny)
+
+// ─── COLORS ───────────────────────────────────────────────────────────────────
+C_HDR  = color.new(#1a1a2e, 5)
+C_ROW1 = color.new(#16213e, 5)
+C_ROW2 = color.new(#0f3460, 5)
+C_BRD  = color.new(#e94560, 0)
+C_TXT  = color.new(#e0e0e0, 0)
+C_GRN  = color.new(#00ff88, 0)
+C_RED  = color.new(#ff4757, 0)
+C_YLW  = color.new(#ffd32a, 0)
+C_DIM  = color.new(#a0a0b0, 0)
+
+// ─── DASHBOARD ────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 36, bgcolor=C_ROW1, border_color=C_BRD, border_width=1, frame_color=C_BRD, frame_width=2)
+n   = array.size(sig_t)
+idx = sel_sig == 0 ? n - 1 : math.min(sel_sig - 1, n - 1)
+
+table.cell(dash, 0, 0, " v7 SNIPER 3TF ", text_color=C_TXT, bgcolor=C_HDR, text_halign=text.align_center, text_size=size.small)
+table.merge_cells(dash, 0, 0, 1, 0)
+
+if n == 0 and not setup_armed
+    table.cell(dash, 0, 1, "  3TF: D + " + htf_tf + " + 1H + " + ltf_tf + "  |  No signal yet", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(dash, 0, 1, 1, 1)
+else
+    ep   = array.get(sig_ep,   idx)
+    slv  = array.get(sig_sl_a, idx)
+    tpv  = array.get(sig_tp_a, idx)
+    rk   = array.get(sig_risk, idx)
+    sc   = array.get(sig_cnt,  idx)
+    dir  = array.get(sig_dir,  idx)
+    styp = array.get(sig_type, idx)
+    res_str = strategy.position_size != 0 ? " IN TRADE" : " PENDING"
+    res_col = C_YLW
+    for i = 0 to strategy.closedtrades - 1
+        if math.abs(strategy.closedtrades.entry_price(i) - ep) < 1.0
+            res_str := strategy.closedtrades.profit(i) > 0 ? " WIN" : " LOSS"
+            res_col := strategy.closedtrades.profit(i) > 0 ? C_GRN : C_RED
+    sig_lbl   = " #" + str.tostring(sc) + " / " + str.tostring(total_sigs)
+    regime_is_bull = ema_rising  and daily_struct_bull
+    regime_is_bear = ema_falling and daily_struct_bear
+    regime_lbl = regime_is_bull ? " BULL" : regime_is_bear ? " BEAR" : " NEUTRAL"
+    regime_col = regime_is_bull ? C_GRN  : regime_is_bear ? C_RED  : C_DIM
+    pyr_lbl = pyramid_cnt == 0 ? " 0/2" : pyramid_cnt == 1 ? " 1/2" : " 2/2 (BE)"
+    pyr_col = pyramid_cnt == 2 ? C_GRN : pyramid_cnt == 1 ? C_YLW : C_DIM
+    setup_lbl = setup_armed ? " ARMED " + setup_dir + " (" + str.tostring(setup_bars_left) + "b)" : " idle"
+    setup_col = setup_armed ? (setup_dir == "LONG" ? C_GRN : C_RED) : C_DIM
+    ltf_status = use_ltf_precision ? (setup_armed and (ltf_long_ok or ltf_short_ok) ? " ✓ LTF rejection" : " scanning " + ltf_tf) : " OFF"
+    ltf_col    = use_ltf_precision and (ltf_long_ok or ltf_short_ok) ? C_GRN : C_DIM
+    dir_col  = dir == "LONG" ? C_GRN : C_RED
+
+    table.cell(dash, 0, 1, " 3TF STACK", text_color=C_YLW, bgcolor=C_ROW2, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(dash, 0, 1, 1, 1)
+    table.cell(dash, 0, 2, " HTF (" + htf_tf + ")", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 2, ema_rising ? " RISING" : " FALLING", text_color=ema_rising ? C_GRN : C_RED, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 3, " Daily", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 3, daily_struct_bull ? " HH/HL ↑" : daily_struct_bear ? " LL/LH ↓" : " MIXED", text_color=daily_struct_bull ? C_GRN : daily_struct_bear ? C_RED : C_DIM, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 4, " 1H Setup", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 4, setup_lbl, text_color=setup_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 5, " LTF (" + ltf_tf + ")", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 5, ltf_status, text_color=ltf_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 6, "", bgcolor=C_BRD, text_color=C_BRD, text_size=size.tiny)
+    table.merge_cells(dash, 0, 6, 1, 6)
+
+    table.cell(dash, 0, 7, " HTF FILTERS", text_color=C_YLW, bgcolor=C_ROW2, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(dash, 0, 7, 1, 7)
+    table.cell(dash, 0, 8, " Bias", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 8, regime_lbl, text_color=regime_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 9, " HTF EMA20", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 9, close > htf_ema20 ? " Above" : " Below", text_color=close > htf_ema20 ? C_GRN : C_RED, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 10, " HTF VWAP", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 10, close > htf_vwap ? " Above" : " Below", text_color=close > htf_vwap ? C_GRN : C_RED, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 11, " 1H Range", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 11, range_expand ? " EXPANDING" : " NORMAL", text_color=range_expand ? C_GRN : C_DIM, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 12, "", bgcolor=C_BRD, text_color=C_BRD, text_size=size.tiny)
+    table.merge_cells(dash, 0, 12, 1, 12)
+
+    // Freshness — show signal section only if armed/in-trade/recent
+    bars_since_sig = last_sig_bar < 0 ? 99999 : bar_index - last_sig_bar
+    has_armed     = setup_armed
+    has_position  = strategy.position_size != 0
+    has_recent    = bars_since_sig <= sig_freshness_bars
+    show_signal   = has_armed or has_position or has_recent
+
+    sig_section_lbl = has_armed ? " LATEST: ARMED ▶" : has_position ? " LATEST: IN TRADE" : has_recent ? " LATEST SIGNAL" : " LATEST: —"
+    sig_section_col = has_armed ? C_YLW : has_position ? color.new(color.orange, 0) : has_recent ? C_YLW : C_DIM
+
+    table.cell(dash, 0, 13, sig_section_lbl, text_color=sig_section_col, bgcolor=C_ROW2, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(dash, 0, 13, 1, 13)
+
+    if show_signal
+        // Use armed-setup data if armed (no entry yet), else use last fired-signal data
+        ep_disp  = has_armed ? setup_limit_price : ep
+        sl_disp  = has_armed ? setup_stop_price  : slv
+        rk_disp  = has_armed ? math.abs(setup_limit_price - setup_stop_price) : rk
+        tp_disp  = has_armed ? (setup_dir == "LONG" ? setup_limit_price + rk_disp * tp2_r : setup_limit_price - rk_disp * tp2_r) : tpv
+        dir_disp = has_armed ? setup_dir : dir
+        styp_disp = has_armed ? (setup_type + "-PENDING") : styp
+        dir_col_d = dir_disp == "LONG" ? C_GRN : C_RED
+        type_col_d = has_armed ? C_YLW : (str.contains(styp_disp, "3TF") ? color.new(color.orange, 0) : C_TXT)
+
+        table.cell(dash, 0, 14, " Signal #", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 14, sig_lbl, text_color=C_TXT, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 15, " Type", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 15, " " + styp_disp, text_color=type_col_d, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 16, " Direction", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 16, " " + dir_disp, text_color=dir_col_d, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 17, has_armed ? " Limit" : " Entry", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 17, str.tostring(ep_disp, "#.00"), text_color=has_armed ? C_YLW : C_TXT, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 18, " Stop", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 18, str.tostring(sl_disp, "#.00"), text_color=C_RED, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 19, " TP2", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 19, str.tostring(tp_disp, "#.00"), text_color=C_GRN, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 20, " Risk", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 20, str.tostring(rk_disp, "#.00") + " pts", text_color=C_YLW, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 21, " Pyramid", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 21, pyr_lbl, text_color=pyr_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+        table.cell(dash, 0, 22, " Result", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.cell(dash, 1, 22, res_str, text_color=res_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    else
+        table.cell(dash, 0, 14, "  No active signal", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.merge_cells(dash, 0, 14, 1, 14)
+        table.cell(dash, 0, 15, "  Last fired " + str.tostring(bars_since_sig) + " bars ago", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.merge_cells(dash, 0, 15, 1, 15)
+        table.cell(dash, 0, 16, "  Waiting for next setup", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+        table.merge_cells(dash, 0, 16, 1, 16)
+        for r = 17 to 22
+            table.cell(dash, 0, r, "", text_color=C_ROW1, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.tiny)
+            table.merge_cells(dash, 0, r, 1, r)
+
+    table.cell(dash, 0, 23, "", bgcolor=C_BRD, text_color=C_BRD, text_size=size.tiny)
+    table.merge_cells(dash, 0, 23, 1, 23)
+
+    table.cell(dash, 0, 24, " ACCOUNT", text_color=C_YLW, bgcolor=C_ROW2, text_halign=text.align_left, text_size=size.small)
+    table.merge_cells(dash, 0, 24, 1, 24)
+    bal_val  = strategy.equity
+    pnl_val  = bal_val - acct_start
+    pnl_str  = (pnl_val >= 0 ? " +" : " -") + "$" + str.tostring(math.abs(pnl_val), "#.00")
+    pnl_col  = pnl_val >= 0 ? C_GRN : C_RED
+    tdd_used = math.max(0.0, acct_start - bal_val)
+    tdd_left = math.max(0.0, max_total_dd - tdd_used)
+    stat_s   = target_hit ? " TARGET HIT" : not total_dd_ok ? " BLOWN" : not daily_dd_ok ? " DAILY LIMIT" : day_locked ? " LOCKED" : " ACTIVE"
+    stat_c   = target_hit ? C_GRN : not total_dd_ok ? C_RED : not daily_dd_ok ? C_RED : day_locked ? C_RED : C_GRN
+    table.cell(dash, 0, 25, " Balance", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 25, " $" + str.tostring(bal_val, "#.00"), text_color=C_TXT, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 26, " Net P&L", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 26, pnl_str, text_color=pnl_col, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 27, " Total DD Left", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 27, " $" + str.tostring(tdd_left, "#.00"), text_color=tdd_left < 200 ? C_RED : tdd_left < 500 ? C_YLW : C_GRN, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
+    table.cell(dash, 0, 28, " Status", text_color=C_DIM, bgcolor=C_ROW1, text_halign=text.align_left, text_size=size.small)
+    table.cell(dash, 1, 28, stat_s, text_color=stat_c, bgcolor=C_ROW1, text_halign=text.align_right, text_size=size.small)
