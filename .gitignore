@@ -2,3 +2,7 @@
 *.log
 safety-check-log.json
 node_modules/
+
+# Claude Code local settings
+.claude/
+
