@@ -12,6 +12,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
+import http from "http";
 import { execSync } from "child_process";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
@@ -39,6 +40,11 @@ function checkOnboarding() {
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=4H",
+        "",
+        "# TradingView webhook (set WEBHOOK_MODE=true to receive TV alerts)",
+        "WEBHOOK_MODE=false",
+        "WEBHOOK_PORT=3000",
+        "WEBHOOK_SECRET=",
       ].join("\n") + "\n",
     );
     try {
@@ -79,6 +85,9 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
+  webhookMode: process.env.WEBHOOK_MODE === "true",
+  webhookPort: parseInt(process.env.WEBHOOK_PORT || "3000"),
+  webhookSecret: process.env.WEBHOOK_SECRET || "",
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
@@ -182,7 +191,7 @@ function calcVWAP(candles) {
 
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+function runSafetyCheck(price, ema8, vwap, rsi3, rules, tvAction = null) {
   const results = [];
 
   const check = (label, required, actual, pass) => {
@@ -193,10 +202,11 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
   };
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
+  if (tvAction) console.log(`  Source: TradingView alert — action: ${tvAction}\n`);
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  // Direction: trust TradingView if provided, otherwise derive from indicators
+  const bullishBias = tvAction === "buy" || (!tvAction && price > vwap && price > ema8);
+  const bearishBias = tvAction === "sell" || (!tvAction && price < vwap && price < ema8);
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
@@ -493,8 +503,8 @@ function generateTaxSummary() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-async function run() {
-  checkOnboarding();
+async function run(tvSignal = null) {
+  if (!CONFIG.webhookMode) checkOnboarding();
   initCsv();
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
@@ -502,7 +512,13 @@ async function run() {
   console.log(
     `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
   );
+  if (tvSignal) console.log(`  Triggered by: TradingView alert`);
   console.log("═══════════════════════════════════════════════════════════");
+
+  // Override symbol from TradingView payload if provided
+  if (tvSignal?.symbol) {
+    CONFIG.symbol = tvSignal.symbol.replace(/^BINANCE:/, "").replace(/\.P$/, "");
+  }
 
   // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
@@ -538,8 +554,8 @@ async function run() {
     return;
   }
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  // Run safety check (pass TradingView action if present to force direction)
+  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules, tvSignal?.action ?? null);
 
   // Calculate position size
   const tradeSize = Math.min(
@@ -616,8 +632,84 @@ async function run() {
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
+// ─── TradingView Webhook Server ──────────────────────────────────────────────
+
+function startWebhookServer() {
+  checkOnboarding();
+  initCsv();
+
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/webhook") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", async () => {
+        try {
+          const payload = JSON.parse(body);
+
+          // Validate secret when configured
+          if (CONFIG.webhookSecret && payload.secret !== CONFIG.webhookSecret) {
+            console.log("⚠️  Webhook rejected — invalid secret");
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Unauthorized" }));
+            return;
+          }
+
+          console.log(`\n🔔 TradingView alert: action=${payload.action} symbol=${payload.symbol || CONFIG.symbol} price=${payload.price || "live"}`);
+
+          const tvSignal = {
+            action: payload.action,   // "buy" | "sell"
+            symbol: payload.symbol,   // e.g. "BTCUSDT" or "BINANCE:BTCUSDT"
+            price:  payload.price,    // optional — bot will fetch live price if absent
+          };
+
+          await run(tvSignal);
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "processed" }));
+        } catch (err) {
+          console.error("Webhook error:", err.message);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("Not found");
+  });
+
+  server.listen(CONFIG.webhookPort, () => {
+    console.log("═══════════════════════════════════════════════════════════");
+    console.log("  Claude Trading Bot — TradingView Webhook Mode");
+    console.log(`  POST http://localhost:${CONFIG.webhookPort}/webhook`);
+    console.log(`  GET  http://localhost:${CONFIG.webhookPort}/health`);
+    console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
+    if (CONFIG.webhookSecret) {
+      console.log(`  Secret: configured ✅`);
+    } else {
+      console.log(`  Secret: not set ⚠️  (set WEBHOOK_SECRET in .env for security)`);
+    }
+    console.log("═══════════════════════════════════════════════════════════");
+    console.log("\nWaiting for TradingView alerts...\n");
+    console.log("TradingView alert message format (JSON):");
+    console.log('  {"action":"{{strategy.order.action}}","symbol":"{{ticker}}","price":{{close}},"secret":"YOUR_SECRET"}');
+    console.log("");
+  });
+}
+
+// ─── Entry Point ─────────────────────────────────────────────────────────────
+
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
+} else if (CONFIG.webhookMode) {
+  startWebhookServer();
 } else {
   run().catch((err) => {
     console.error("Bot error:", err);
