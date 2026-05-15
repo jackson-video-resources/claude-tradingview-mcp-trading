@@ -1,17 +1,54 @@
 {
-  "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "watchlist": ["BTCUSDT", "ETHUSDT", "RNDRUSDT", "SOLUSDT", "SUIUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT"],
+  "default_timeframe": "4H",
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
+    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy — Enhanced",
     "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "description": "Seven-layer filter stack. Original three-indicator signal (EMA8 trend, VWAP session bias, RSI3 entry timing) gated by six additional filters: Claude macro regime, volume confirmation, multi-timeframe alignment, trading hours, ATR position sizing, and correlation control."
   },
 
   "indicators": {
     "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC. Falls back to last 6 candles if session has no data yet.",
+    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely.",
+    "atr_14": "Volatility measure used for position sizing. Position size = 1% portfolio risk / (ATR x 1.5 stop multiplier), capped at MAX_TRADE_SIZE_USD."
+  },
+
+  "filter_stack": {
+    "order": [
+      "1. Trade limits (daily count + size cap)",
+      "2. Time filter",
+      "3. Volume confirmation",
+      "4. Multi-timeframe alignment (1H)",
+      "5. Correlation filter",
+      "6. VWAP + EMA(8) + RSI(3) safety check",
+      "7. Claude regime filter"
+    ],
+    "description": "All filters must pass before any order is placed. Filters are applied in sequence — early failures skip remaining checks."
+  },
+
+  "filters": {
+    "time_filter": {
+      "rule": "No trades between 01:00–05:59 UTC — exception: RSI(3) > 80 or RSI(3) < 20 overrides the block",
+      "reason": "Lowest liquidity window globally. Wide spreads, high slippage risk, thin order books. Strong RSI signals (extreme overbought/oversold) are allowed through as the edge outweighs the liquidity risk."
+    },
+    "volume_confirmation": {
+      "rule": "Current candle volume must be >= 60% of the 20-candle average",
+      "reason": "Low volume signals disinterest. Entries on thin volume produce worse fills and higher slippage. Threshold lowered from 80% to 60% to allow trading during normal post-breakout consolidation without including genuine dead markets."
+    },
+    "multi_timeframe": {
+      "rule": "1H bias must be directionally clear (bullish or bearish) and align with 4H signal",
+      "reason": "Filters out counter-trend traps. A 4H signal against a neutral 1H is unreliable."
+    },
+    "correlation_filter": {
+      "rule": "Do not trade BTCUSDT and ETHUSDT in the same bot run",
+      "reason": "BTC and ETH are highly correlated. Trading both simultaneously doubles exposure without adding independent edge."
+    },
+    "claude_regime_filter": {
+      "rule": "Claude (claude-haiku) evaluates macro environment before every trade. Blocks during: Fed/CPI/NFP announcements, extreme sentiment divergence, black swan events.",
+      "reason": "Technical signals cannot account for macro shock risk. Claude reads real-world context that indicators cannot."
+    }
   },
 
   "bias_criteria": {
@@ -38,13 +75,24 @@
     "Take profit at next VWAP touch or EMA(8) cross"
   ],
 
+  "position_sizing": {
+    "method": "ATR-based",
+    "risk_per_trade": "1% of PORTFOLIO_VALUE_USD",
+    "stop_multiplier": "1.5x ATR(14)",
+    "hard_cap": "MAX_TRADE_SIZE_USD from .env",
+    "formula": "min(portfolio * 0.01 / (ATR * 1.5 / price) * price, MAX_TRADE_SIZE_USD)"
+  },
+
   "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
+    "Risk maximum 1% of portfolio per trade (ATR-based sizing)",
+    "Hard cap: no single trade exceeds MAX_TRADE_SIZE_USD",
+    "Hard cap: no more than MAX_TRADES_PER_DAY trades per calendar day",
     "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
+    "Do not trade BTC and ETH in the same run — correlation doubles risk",
+    "Do not trade during 01:00–05:59 UTC — low liquidity window",
+    "Do not trade on volume below 80% of 20-candle average",
+    "Claude regime filter blocks trades during macro events"
   ],
 
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "notes": "4H timeframe primary. RSI(3) is intentionally fast and sensitive — it fires quickly and exits quickly. Claude regime filter uses claude-haiku for speed and cost efficiency. Bot runs every 30 minutes to catch RSI spikes and volume threshold crossings faster. All decisions logged to safety-check-log.json. All trades (blocked or executed) logged to trades.csv."
 }

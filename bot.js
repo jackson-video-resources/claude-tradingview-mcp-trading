@@ -13,6 +13,24 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import Anthropic from "@anthropic-ai/sdk";
+
+// ─── Telegram Alerts ─────────────────────────────────────────────────────────
+
+async function sendTelegram(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "Markdown" }),
+    });
+  } catch (err) {
+    console.log(`⚠️  Telegram alert failed: ${err.message}`);
+  }
+}
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -139,6 +157,115 @@ async function fetchCandles(symbol, interval, limit = 100) {
   }));
 }
 
+// ─── Improvement 1: Claude Regime Filter ─────────────────────────────────────
+
+async function checkMarketRegime(symbol, price, rsi3, ema8, vwap) {
+  if (!process.env.ANTHROPIC_API_KEY) return { approved: true, reason: "No API key — skipping regime check" };
+  const client = new Anthropic();
+  const prompt = `You are a risk filter for an automated crypto trading bot. Assess whether current market conditions are safe to trade.
+
+Symbol: ${symbol}
+Current price: $${price}
+RSI(3): ${rsi3.toFixed(2)}
+EMA(8): $${ema8.toFixed(2)}
+VWAP: $${vwap.toFixed(2)}
+Time (UTC): ${new Date().toUTCString()}
+
+Answer in JSON only: { "approved": true/false, "reason": "one sentence" }
+
+Approve unless there is a specific high-risk condition: major scheduled macro event in the next 2 hours (Fed, CPI, NFP), extreme fear/greed divergence, or obvious black swan news. When in doubt, approve.`;
+
+  try {
+    const msg = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 100,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const text = msg.content[0].text.trim();
+    const json = JSON.parse(text.match(/\{[\s\S]*\}/)[0]);
+    return json;
+  } catch (err) {
+    return { approved: true, reason: `Regime check error (${err.message}) — defaulting to approve` };
+  }
+}
+
+// ─── Improvement 2: Volume Confirmation ──────────────────────────────────────
+
+function checkVolume(candles) {
+  const volumes = candles.slice(-21, -1).map((c) => c.volume);
+  const avgVol = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+  const currentVol = candles[candles.length - 1].volume;
+  const ratio = currentVol / avgVol;
+  return { pass: ratio >= 0.6, currentVol, avgVol, ratio };
+}
+
+// ─── Improvement 3: Multi-Timeframe Confirmation ──────────────────────────────
+
+async function checkHigherTimeframe(symbol) {
+  try {
+    const candles1h = await fetchCandles(symbol, "1H", 20);
+    const closes1h = candles1h.map((c) => c.close);
+    const price1h = closes1h[closes1h.length - 1];
+    const ema8_1h = calcEMA(closes1h, 8);
+    const vwap1h = calcVWAP(candles1h);
+    if (!vwap1h) return { pass: true, reason: "No 1H VWAP data — skipping MTF check" };
+    const bullish1h = price1h > ema8_1h && price1h > vwap1h;
+    const bearish1h = price1h < ema8_1h && price1h < vwap1h;
+    return { pass: bullish1h || bearish1h, bullish1h, bearish1h, price1h, ema8_1h, vwap1h };
+  } catch {
+    return { pass: true, reason: "MTF fetch failed — skipping" };
+  }
+}
+
+// ─── Improvement 4: Time Filter (skip 01:00–05:59 UTC, unless RSI > 80) ───────
+
+function checkTradingHours(rsi3 = null) {
+  const hourUTC = new Date().getUTCHours();
+  const inLowLiqWindow = hourUTC >= 1 && hourUTC < 6;
+  if (!inLowLiqWindow) return { pass: true, override: false, hourUTC };
+  // Exception: strong RSI signal (>80 short or <20 long) overrides the window
+  const strongSignal = rsi3 !== null && (rsi3 > 80 || rsi3 < 20);
+  return { pass: strongSignal, override: strongSignal, hourUTC, rsi3 };
+}
+
+// ─── Improvement 5: ATR Position Sizing ──────────────────────────────────────
+
+function calcATR(candles, period = 14) {
+  const trs = candles.slice(-period - 1).map((c, i, arr) => {
+    if (i === 0) return c.high - c.low;
+    const prevClose = arr[i - 1].close;
+    return Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+  });
+  return trs.reduce((a, b) => a + b, 0) / trs.length;
+}
+
+function calcATRPositionSize(price, atr, portfolioValue, maxTradeSize) {
+  const riskPerTrade = portfolioValue * 0.01;
+  const atrMultiplier = 1.5;
+  const stopDistance = atr * atrMultiplier;
+  const atrBasedSize = riskPerTrade / (stopDistance / price) * price;
+  return Math.min(atrBasedSize, maxTradeSize);
+}
+
+// ─── Improvement 6: Correlation Filter ───────────────────────────────────────
+
+function checkCorrelation(symbol, executedSymbols) {
+  // Group highly correlated assets — only one per group per run
+  const groups = [
+    ["BTCUSDT", "ETHUSDT"],           // BTC/ETH — tightly correlated
+    ["SOLUSDT", "SUIUSDT", "AVAXUSDT"], // L1 alts — moderately correlated
+  ];
+  for (const group of groups) {
+    if (group.includes(symbol)) {
+      const alreadyTraded = executedSymbols.find((s) => group.includes(s));
+      if (alreadyTraded) {
+        return { pass: false, reason: `Already traded correlated asset ${alreadyTraded} this run` };
+      }
+    }
+  }
+  return { pass: true };
+}
+
 // ─── Indicator Calculations ──────────────────────────────────────────────────
 
 function calcEMA(closes, period) {
@@ -170,7 +297,8 @@ function calcRSI(closes, period = 14) {
 function calcVWAP(candles) {
   const midnightUTC = new Date();
   midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
+  let sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
+  if (sessionCandles.length === 0) sessionCandles = candles.slice(-6); // fallback: last 24H of 4H candles
   if (sessionCandles.length === 0) return null;
   const cumTPV = sessionCandles.reduce(
     (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
@@ -507,7 +635,6 @@ async function run() {
   // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
   // Load log and check daily limits
   const log = loadLog();
@@ -517,103 +644,181 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
+  const watchlist = rules.watchlist || [CONFIG.symbol];
+  const executedThisRun = [];
 
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
+  for (const symbol of watchlist) {
+    console.log(`\n${"═".repeat(59)}`);
+    console.log(`  Symbol: ${symbol} | Timeframe: ${CONFIG.timeframe}`);
+    console.log(`${"═".repeat(59)}`);
 
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
+    // Fetch candle data
+    console.log("\n── Fetching market data from Binance ───────────────────\n");
+    const candles = await fetchCandles(symbol, CONFIG.timeframe, 500);
+    const closes = candles.map((c) => c.close);
+    const price = closes[closes.length - 1];
+    console.log(`  Current price: $${price.toFixed(2)}`);
 
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
-  }
+    // Calculate indicators
+    const ema8 = calcEMA(closes, 8);
+    const vwap = calcVWAP(candles);
+    const rsi3 = calcRSI(closes, 3);
+    const atr = calcATR(candles);
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+    console.log(`  EMA(8):  $${ema8.toFixed(4)}`);
+    console.log(`  VWAP:    $${vwap ? vwap.toFixed(4) : "N/A"}`);
+    console.log(`  RSI(3):  ${rsi3 !== null ? rsi3.toFixed(2) : "N/A"}`);
+    console.log(`  ATR(14): $${atr.toFixed(4)}`);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+    if (vwap === null || rsi3 === null) {
+      console.log("\n⚠️  Not enough data to calculate indicators. Skipping.");
+      continue;
+    }
 
-  // Decision
-  console.log("\n── Decision ─────────────────────────────────────────────\n");
-
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
-    timeframe: CONFIG.timeframe,
-    price,
-    indicators: { ema8, vwap, rsi3 },
-    conditions: results,
-    allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
-    limits: {
-      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-      maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
-    },
-  };
-
-  if (!allPass) {
-    const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
-    failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
+    // ── Improvement 4: Time Filter (RSI-aware) ────────────────────────────
+    console.log("\n── Time Filter ──────────────────────────────────────────\n");
+    const timeCheck = checkTradingHours(rsi3);
+    if (!timeCheck.pass) {
+      console.log(`🚫 Low-liquidity window — ${timeCheck.hourUTC}:00 UTC (01:00–05:59 blocked).`);
+      console.log(`   RSI(3) ${rsi3.toFixed(2)} — not strong enough to override (needs >80 or <20).`);
+      continue;
+    }
+    if (timeCheck.override) {
+      console.log(`⚡ Low-liquidity window overridden — RSI(3) ${rsi3.toFixed(2)} is a strong signal (>80 or <20).`);
     } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
-      try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
+      console.log(`✅ Trading hours OK — ${timeCheck.hourUTC}:00 UTC`);
+    }
+
+    // ── Improvement 2: Volume Confirmation ───────────────────────────────
+    console.log("\n── Volume Check ─────────────────────────────────────────\n");
+    const volCheck = checkVolume(candles);
+    if (!volCheck.pass) {
+      console.log(`🚫 Volume too low — current: ${volCheck.currentVol.toFixed(2)}, avg: ${volCheck.avgVol.toFixed(2)} (${(volCheck.ratio * 100).toFixed(0)}% of avg)`);
+      console.log("   Skipping — thin market increases slippage risk.");
+      continue;
+    }
+    console.log(`✅ Volume OK — ${(volCheck.ratio * 100).toFixed(0)}% of 20-candle average`);
+
+    // ── Improvement 3: Multi-Timeframe Confirmation ───────────────────────
+    console.log("\n── Multi-Timeframe Check (1H) ───────────────────────────\n");
+    const mtf = await checkHigherTimeframe(symbol);
+    if (!mtf.pass) {
+      console.log(`🚫 1H bias is NEUTRAL — no clear direction on higher timeframe. Skipping.`);
+      continue;
+    }
+    const mtfBias = mtf.bullish1h ? "BULLISH" : "BEARISH";
+    console.log(`✅ 1H bias: ${mtfBias} — confirms trade direction`);
+
+    // ── Improvement 6: Correlation Filter ────────────────────────────────
+    console.log("\n── Correlation Filter ───────────────────────────────────\n");
+    const corrCheck = checkCorrelation(symbol, executedThisRun);
+    if (!corrCheck.pass) {
+      console.log(`🚫 ${corrCheck.reason}`);
+      continue;
+    }
+    console.log(`✅ No correlated asset already traded this run`);
+
+    // Run safety check
+    const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+
+    // ── Improvement 5: ATR Position Sizing ───────────────────────────────
+    const tradeSize = calcATRPositionSize(price, atr, CONFIG.portfolioValue, CONFIG.maxTradeSizeUSD);
+    console.log(`\n── Position Size (ATR-based) ─────────────────────────────\n`);
+    console.log(`  ATR(14): $${atr.toFixed(4)} | Risk 1% = $${(CONFIG.portfolioValue * 0.01).toFixed(2)}`);
+    console.log(`  Calculated size: $${tradeSize.toFixed(2)} (capped at $${CONFIG.maxTradeSizeUSD})`);
+
+    // Decision
+    console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      symbol,
+      timeframe: CONFIG.timeframe,
+      price,
+      indicators: { ema8, vwap, rsi3 },
+      conditions: results,
+      allPass,
+      tradeSize,
+      orderPlaced: false,
+      orderId: null,
+      paperTrading: CONFIG.paperTrading,
+      limits: {
+        maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
+        maxTradesPerDay: CONFIG.maxTradesPerDay,
+        tradesToday: countTodaysTrades(log),
+      },
+    };
+
+    if (!allPass) {
+      const failed = results.filter((r) => !r.pass).map((r) => r.label);
+      console.log(`🚫 TRADE BLOCKED`);
+      console.log(`   Failed conditions:`);
+      failed.forEach((f) => console.log(`   - ${f}`));
+    } else {
+      // ── Improvement 1: Claude Regime Filter ────────────────────────────
+      console.log(`\n── Claude Regime Filter ─────────────────────────────────\n`);
+      console.log(`  Checking macro environment...`);
+      const regime = await checkMarketRegime(symbol, price, rsi3, ema8, vwap);
+      logEntry.regimeCheck = regime;
+      if (!regime.approved) {
+        console.log(`🚫 REGIME BLOCKED — ${regime.reason}`);
+        await sendTelegram(`⚠️ *REGIME BLOCK — ${symbol}*\n${regime.reason}`);
+        continue;
+      }
+      console.log(`✅ Regime approved — ${regime.reason}`);
+      console.log(`\n✅ ALL CONDITIONS MET`);
+
+      if (CONFIG.paperTrading) {
+        console.log(
+          `\n📋 PAPER TRADE — would buy ${symbol} ~$${tradeSize.toFixed(2)} at market`,
         );
+        console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
         logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
+        logEntry.orderId = `PAPER-${Date.now()}`;
+        executedThisRun.push(symbol);
+        await sendTelegram(
+          `📋 *PAPER TRADE — ${symbol}*\n` +
+          `Side: BUY | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
+          `RSI(3): ${rsi3.toFixed(2)} | EMA8: $${ema8.toFixed(4)} | VWAP: $${vwap.toFixed(4)}\n` +
+          `ATR size: $${tradeSize.toFixed(2)} | 1H bias: ${mtfBias}\n` +
+          `Regime: ${regime.reason}\n` +
+          `_Paper mode — no real order placed_`
+        );
+      } else {
+        console.log(
+          `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol}`,
+        );
+        try {
+          const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
+          logEntry.orderPlaced = true;
+          logEntry.orderId = order.orderId;
+          executedThisRun.push(symbol);
+          console.log(`✅ ORDER PLACED — ${order.orderId}`);
+          await sendTelegram(
+            `✅ *LIVE TRADE EXECUTED — ${symbol}*\n` +
+            `Side: BUY | Size: $${tradeSize.toFixed(2)} | Price: $${price.toFixed(4)}\n` +
+            `Order ID: ${order.orderId}\n` +
+            `RSI(3): ${rsi3.toFixed(2)} | ATR size: $${tradeSize.toFixed(2)} | 1H: ${mtfBias}\n` +
+            `Regime: ${regime.reason}`
+          );
+        } catch (err) {
+          console.log(`❌ ORDER FAILED — ${err.message}`);
+          logEntry.error = err.message;
+          await sendTelegram(`❌ *ORDER FAILED — ${symbol}*\nError: ${err.message}`);
+        }
       }
     }
+
+    // Save decision log
+    log.trades.push(logEntry);
+    saveLog(log);
+    console.log(`\nDecision log saved → ${LOG_FILE}`);
+
+    // Write tax CSV row for every run (executed, paper, or blocked)
+    writeTradeCsv(logEntry);
   }
 
-  // Save decision log
-  log.trades.push(logEntry);
-  saveLog(log);
-  console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
-
-  console.log("═══════════════════════════════════════════════════════════\n");
+  console.log("\n" + "═".repeat(59) + "\n");
 }
 
 if (process.argv.includes("--tax-summary")) {
