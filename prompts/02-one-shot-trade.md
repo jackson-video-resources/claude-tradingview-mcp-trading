@@ -317,9 +317,12 @@ Tell them: "On it. I'm going to scrape the transcripts of their last 100 videos
 and extract a trading strategy from them. This takes about 10–20 minutes. I'll
 let you know when it's done."
 
-Use the Apify YouTube Transcript Scraper to pull transcripts from that channel URL.
+Use the Apify YouTube Transcripts API to pull transcripts from that channel URL.
 Use their APIFY_API_KEY from .env.
-API endpoint: `https://api.apify.com/v2/acts/streamers~youtube-transcript/runs`
+API endpoint: `https://api.apify.com/v2/acts/johnvc~YoutubeTranscripts/runs`
+Input: `{"channel": "<the channel URL>", "channel_transcripts": true, "max_videos": 100}`
+When the run finishes, read its dataset: the transcript text is in `non_timestamped`.
+Skip rows where `success` is `false` and the `channel_video` listing rows.
 
 Once transcripts are returned, extract the trading strategy using the prompt in
 `prompts/01-extract-strategy.md`. Save the output to `rules.json`.
