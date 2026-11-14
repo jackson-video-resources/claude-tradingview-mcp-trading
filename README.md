@@ -276,6 +276,16 @@ Additional guardrails that apply regardless of strategy:
 - Every decision logged to `safety-check-log.json` with exact indicator values
 - Every executed trade recorded in `trades.csv` for accounting
 
+### Optional: External Pre-Trade Risk Receipt via MCP (`fahali-mcp`)
+
+If you want Step 5 (`safety-check-log.json`) to include an independent market-regime and tail-risk observation alongside your indicator rules before Step 6 places a BitGet order, you can add [`fahali-mcp`](https://github.com/Future-Legends-Inc/fahali-mcp) (read-only market risk sensor, no exchange credentials required) to Claude Code:
+
+```bash
+claude mcp add fahali-risk -- npx -y fahali-mcp
+```
+
+Claude can then call `assess_symbol_risk` (e.g., `{"symbol": "BTCUSDT"}`) during Step 5 and record the timestamped risk observation and `verdictId` directly into `safety-check-log.json`.
+
 **This is not financial advice.** Build your strategy properly. Run the backtest. Paper trade before going live. Never put in more than you can afford to lose.
 
 ---
